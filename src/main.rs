@@ -6,6 +6,7 @@ mod console;
 mod arch;
 mod drivers;
 mod mm;
+mod proc;
 mod sync;
 
 extern crate alloc;
@@ -15,8 +16,9 @@ use arch::x86_64::multiboot2::BootInfo;
 use arch::x86_64::{idt, pic, pit, serial, vga};
 use core::panic::PanicInfo;
 use drivers::ps2;
+use proc::scheduler;
 
-const REPORT_INTERVAL_MS: u64 = 1000;
+const TASK_REPORT_INTERVAL_MS: u64 = 300;
 
 #[no_mangle]
 pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
@@ -49,6 +51,18 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     if let Err(error) = ps2::init() {
         fatal("PS/2 initialization failed", error);
     }
+    if let Err(error) = scheduler::init() {
+        fatal("scheduler initialization failed", error);
+    }
+    if let Err(error) = scheduler::spawn(task_one) {
+        fatal("task 1 spawn failed", error);
+    }
+    if let Err(error) = scheduler::spawn(task_two) {
+        fatal("task 2 spawn failed", error);
+    }
+    if let Err(error) = scheduler::spawn(task_three) {
+        fatal("task 3 spawn failed", error);
+    }
     if let Err(error) = pic::unmask(0) {
         fatal("PIT IRQ unmask failed", error);
     }
@@ -63,43 +77,55 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     kprintln!("IDT loaded with 256 entries");
     kprintln!("PIT configured at {} Hz", pit::FREQUENCY_HZ);
     kprintln!("PS/2 keyboard ready on IRQ1 (scancode set 1)");
-    kprintln!("type to echo keys, press F12 to fault on a null pointer");
+    kprintln!(
+        "scheduler: round-robin, {} tasks ({} ready), timeslice {} ms ({} ticks)",
+        scheduler::task_count(),
+        scheduler::ready_count(),
+        scheduler::TIMESLICE_MS,
+        scheduler::TIMESLICE_TICKS
+    );
     cpu::enable_interrupts();
-    kprintln!("interrupts enabled");
-
-    let mut next_report = (pit::uptime_ms() / REPORT_INTERVAL_MS + 1) * REPORT_INTERVAL_MS;
-    let mut line_open = false;
+    cpu::without_interrupts(|| kprintln!("interrupts enabled"));
+    scheduler::yield_now();
     loop {
         cpu::halt();
         while let Some(key) = ps2::read_key() {
             match key {
-                b'\n' => {
-                    kprintln!();
-                    line_open = false;
-                }
-                b'\t' => {
-                    kprint!("    ");
-                    line_open = true;
-                }
-                0x20..=0x7E => {
-                    kprint!("{}", key as char);
-                    line_open = true;
-                }
+                b'\n' => kprintln!(),
+                b'\t' => kprint!("    "),
+                0x20..=0x7E => kprint!("{}", key as char),
                 _ => {}
             }
         }
         if ps2::take_magic() {
             unsafe { core::ptr::write_volatile(core::ptr::null_mut::<u64>(), 0) };
         }
+    }
+}
+
+extern "C" fn task_one() {
+    task_body(1)
+}
+
+extern "C" fn task_two() {
+    task_body(2)
+}
+
+extern "C" fn task_three() {
+    task_body(3)
+}
+
+fn task_body(id: u32) -> ! {
+    let mut next_report = 0u64;
+    loop {
         let now = pit::uptime_ms();
         if now >= next_report {
-            if line_open {
-                kprintln!();
-                line_open = false;
-            }
-            kprintln!("uptime: {} ms", now);
-            next_report = (now / REPORT_INTERVAL_MS + 1) * REPORT_INTERVAL_MS;
+            cpu::without_interrupts(|| {
+                kprintln!("task {} alive, uptime {} ms", id, now);
+            });
+            next_report = now.saturating_add(TASK_REPORT_INTERVAL_MS);
         }
+        cpu::halt();
     }
 }
 

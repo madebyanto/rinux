@@ -23,6 +23,7 @@ pub fn init() {
 
 pub fn handle_tick() {
     *UPTIME_MS.lock() += TICK_MS;
+    crate::proc::scheduler::on_timer_tick();
 }
 
 pub fn uptime_ms() -> u64 {

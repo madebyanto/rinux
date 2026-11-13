@@ -235,11 +235,11 @@ fn handle_unexpected(frame: &TrapFrame) -> ! {
 }
 
 fn handle_irq(irq: u8) {
+    let _ = pic::eoi(irq);
     let handler = IRQ_HANDLERS.lock()[irq as usize];
     if let Some(handler) = handler {
         handler();
     }
-    let _ = pic::eoi(irq);
 }
 
 pub fn has_error_code(vector: u8) -> bool {
