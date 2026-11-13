@@ -1,0 +1,63 @@
+Rinux
+=====
+
+Rinux is a hobby operating system kernel written in Rust. It aims to be a
+twin of Linux in design, following the same core directions: a monolithic
+kernel with modular structure, UNIX semantics, separation between kernel
+and user space, and "everything is a file".
+
+It boots on x86-64 via Multiboot2 and GRUB, and runs in a virtual machine
+such as QEMU.
+
+
+Goals
+-----
+
+- Monolithic kernel, organized in subsystems (mm, proc, fs, drivers)
+- POSIX-like syscall interface: fork, execve, open, read, write, close
+- Kernel/user space separation with ring 3 execution
+- ELF program loading through execve
+- Virtual filesystem layer: VFS, ext2, devfs, procfs
+- Everything is a file
+
+
+Status
+------
+
+Early development. Currently:
+
+- Multiboot2 boot, 64-bit long mode
+- VGA text console and serial output
+- Basic kernel printing facilities (kprint/kprintln)
+- Physical frame allocator (bitmap, first 1 GiB), built from the Multiboot2 memory map
+- Virtual memory manager: map, unmap and translate for 4 KiB pages
+- Kernel heap with a size-class allocator implementing GlobalAlloc
+
+
+Building
+--------
+
+Requirements:
+
+- Rust nightly toolchain (pin via rust-toolchain.toml)
+- grub-mkrescue and xorriso to build the ISO
+- QEMU to run it
+
+Build and create the bootable image:
+
+    cargo build
+    make image
+
+Run in QEMU:
+
+    make run
+
+Or use the interactive script:
+
+    bash build.sh
+
+
+License
+-------
+
+See the LICENSE file.
