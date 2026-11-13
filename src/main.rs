@@ -5,6 +5,7 @@
 mod console;
 mod arch;
 mod drivers;
+mod fs;
 mod mm;
 mod proc;
 mod sync;
@@ -18,6 +19,7 @@ use arch::x86_64::multiboot2::BootInfo;
 use arch::x86_64::{gdt, idt, pic, pit, serial, vga};
 use core::panic::PanicInfo;
 use drivers::{ata, ps2};
+use fs::vfs::{DirCursor, FileType};
 use proc::scheduler;
 
 const TASK_REPORT_INTERVAL_MS: u64 = 300;
@@ -56,6 +58,7 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     if let Err(error) = ps2::init() {
         fatal("PS/2 initialization failed", error);
     }
+    let ps2_flushed = ps2::flush_stale();
     let ata_info = match ata::init() {
         Ok(info) => info,
         Err(error) => fatal("ATA initialization failed", error),
@@ -98,6 +101,7 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     kprintln!("IDT loaded with 256 entries");
     kprintln!("PIT configured at {} Hz", pit::FREQUENCY_HZ);
     kprintln!("PS/2 keyboard ready on IRQ1 (scancode set 1)");
+    kprintln!("ps2: flushed {} stale keys", ps2_flushed);
     kprintln!(
         "ata: {}, {} sectors (LBA28, LBA48 {})",
         ata_info.model(),
@@ -112,6 +116,11 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
         "ata: MBR signature 0x55AA {}",
         if mbr_found { "found" } else { "not found" }
     );
+    if mbr_found {
+        mount_and_demo(ata_info.sectors);
+    } else {
+        fatal_display("ext2 mount failed", "no MBR signature 0x55AA");
+    }
     kprintln!(
         "gdt: kernel CS/SS {:#x}/{:#x}, user CS/SS {:#x}/{:#x}, TSS {:#x}",
         gdt::KERNEL_CODE,
@@ -182,6 +191,97 @@ fn task_body(id: u32) -> ! {
         }
         cpu::halt();
     }
+}
+
+fn mount_and_demo(disk_sectors: u32) {
+    let info = match fs::mount(disk_sectors) {
+        Ok(info) => info,
+        Err(error) => fatal_display("ext2 mount failed", error),
+    };
+    kprintln!(
+        "ext2: partition start LBA {}, {} sectors",
+        info.partition.start_lba,
+        info.partition.sectors
+    );
+    kprintln!(
+        "ext2: volume \"{}\", block size {}, inode size {}, inodes {}, blocks {}",
+        info.volume,
+        info.block_size,
+        info.inode_size,
+        info.inodes,
+        info.blocks
+    );
+    kprintln!("ext2: /");
+    let root = match fs::root() {
+        Ok(root) => root,
+        Err(error) => fatal_display("ext2 root failed", error),
+    };
+    let mut cursor = DirCursor::new();
+    loop {
+        match fs::readdir(root, &mut cursor) {
+            Ok(Some(entry)) => {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                let slash = if entry.kind == FileType::Directory {
+                    "/"
+                } else {
+                    ""
+                };
+                kprintln!("ext2:   {}{}", entry.name, slash);
+            }
+            Ok(None) => break,
+            Err(error) => fatal_display("ext2 readdir failed", error),
+        }
+    }
+    kprintln!("ext2: cat /hello.txt");
+    let mut file = match fs::open("/hello.txt") {
+        Ok(file) => file,
+        Err(error) => fatal_display("ext2 open failed", error),
+    };
+    let mut buffer = [0u8; 128];
+    loop {
+        match fs::read(&mut file, &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                for byte in &buffer[..count] {
+                    console::write_byte(*byte);
+                }
+            }
+            Err(error) => fatal_display("ext2 read failed", error),
+        }
+    }
+    match fd_self_test() {
+        Ok(()) => kprintln!("ext2: fd self-test ok"),
+        Err(error) => fatal_display("ext2 fd self-test failed", error),
+    }
+}
+
+fn fd_self_test() -> Result<(), &'static str> {
+    let fd = fs::open_fd("/hello.txt").map_err(|_| "open")?;
+    let mut buffer = [0u8; 32];
+    let count = fs::read_file_fd(fd, &mut buffer).map_err(|_| "read")?;
+    if &buffer[..count] != b"hello from ext2\n" {
+        return Err("read content");
+    }
+    if fs::seek_fd(fd, 6, 0).map_err(|_| "seek")? != 6 {
+        return Err("seek offset");
+    }
+    let count = fs::read_file_fd(fd, &mut buffer).map_err(|_| "read after seek")?;
+    if &buffer[..count] != b"from ext2\n" {
+        return Err("read after seek content");
+    }
+    let stat = fs::stat_path("/hello.txt").map_err(|_| "stat")?;
+    if stat.size != 16 {
+        return Err("stat size");
+    }
+    fs::close_fd(fd).map_err(|_| "close")?;
+    Ok(())
+}
+
+fn fatal_display(context: &str, error: impl core::fmt::Display) -> ! {
+    kprintln!("{}: {}", context, error);
+    cpu::halt_forever()
 }
 
 fn fatal(context: &str, error: impl core::fmt::Debug) -> ! {

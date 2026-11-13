@@ -1,3 +1,5 @@
+extern crate alloc;
+
 #[path = "../../src/mm/frame.rs"]
 pub mod frame;
 #[path = "../../src/mm/heap.rs"]
@@ -18,3 +20,5 @@ pub mod user_range;
 pub mod syscall_abi;
 #[path = "../../src/arch/x86_64/descriptor.rs"]
 pub mod descriptor;
+
+pub mod fs;

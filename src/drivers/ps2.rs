@@ -274,6 +274,18 @@ pub fn take_magic() -> bool {
 }
 
 #[cfg(target_os = "none")]
+pub fn flush_stale() -> usize {
+    cpu::without_interrupts(|| {
+        let mut keyboard = KEYBOARD.lock();
+        let mut count = 0;
+        while keyboard.read_key().is_some() {
+            count += 1;
+        }
+        count
+    })
+}
+
+#[cfg(target_os = "none")]
 fn flush_output() {
     for _ in 0..FLUSH_LIMIT {
         if unsafe { inb(STATUS_PORT) } & OUTPUT_FULL == 0 {

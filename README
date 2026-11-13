@@ -9,18 +9,6 @@ and user space, and "everything is a file".
 It boots on x86-64 via Multiboot2 and GRUB, and runs in a virtual machine
 such as QEMU.
 
-
-Goals
------
-
-- Monolithic kernel, organized in subsystems (mm, proc, fs, drivers)
-- POSIX-like syscall interface: fork, execve, open, read, write, close
-- Kernel/user space separation with ring 3 execution
-- ELF program loading through execve
-- Virtual filesystem layer: VFS, ext2, devfs, procfs
-- Everything is a file
-
-
 Status
 ------
 

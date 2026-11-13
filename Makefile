@@ -22,12 +22,14 @@ build:
 	cargo build
 
 $(DISK_IMG):
-	mkdir -p $(DISK_ROOT) $(BUILD_DIR)
+	mkdir -p $(DISK_ROOT)/sub $(BUILD_DIR)
 	printf 'hello from ext2\n' > $(DISK_ROOT)/hello.txt
+	printf 'rinux ext2 demo\n' > $(DISK_ROOT)/readme.txt
+	printf 'nested file\n' > $(DISK_ROOT)/sub/nested.txt
 	truncate -s 32M $(DISK_IMG)
 	printf 'label: dos\nstart=$(DISK_START_LBA), size=$(DISK_SECTORS), type=83\n' | sfdisk $(DISK_IMG)
 	truncate -s 12M $(DISK_PART)
-	mke2fs -t ext2 -F -d $(DISK_ROOT) $(DISK_PART)
+	mke2fs -t ext2 -L rinux -F -d $(DISK_ROOT) $(DISK_PART)
 	dd if=$(DISK_PART) of=$(DISK_IMG) bs=512 seek=$(DISK_START_LBA) conv=notrunc status=none
 	rm -f $(DISK_PART)
 
