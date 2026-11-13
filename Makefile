@@ -4,8 +4,15 @@ KERNEL64 := $(TARGET_DIR)/$(KERNEL_NAME)
 BUILD_DIR := build
 ISO_ROOT := $(BUILD_DIR)/iso_root
 ISO := $(BUILD_DIR)/rinux.iso
+DISK_IMG := $(BUILD_DIR)/disk.img
+DISK_PART := $(BUILD_DIR)/disk-part.img
+DISK_ROOT := $(BUILD_DIR)/disk_root
+DISK_START_LBA := 2048
+DISK_SECTORS := 24576
 QEMU ?= qemu-system-x86_64
-QEMU_FLAGS := -cdrom $(ISO) -m 256M -serial stdio -no-reboot -no-shutdown
+QEMU_FLAGS := -boot order=d -cdrom $(ISO) \
+	-drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
+	-m 256M -serial stdio -no-reboot -no-shutdown
 
 .PHONY: all build image run debug check clean
 
@@ -14,7 +21,17 @@ all: image
 build:
 	cargo build
 
-image: build
+$(DISK_IMG):
+	mkdir -p $(DISK_ROOT) $(BUILD_DIR)
+	printf 'hello from ext2\n' > $(DISK_ROOT)/hello.txt
+	truncate -s 32M $(DISK_IMG)
+	printf 'label: dos\nstart=$(DISK_START_LBA), size=$(DISK_SECTORS), type=83\n' | sfdisk $(DISK_IMG)
+	truncate -s 12M $(DISK_PART)
+	mke2fs -t ext2 -F -d $(DISK_ROOT) $(DISK_PART)
+	dd if=$(DISK_PART) of=$(DISK_IMG) bs=512 seek=$(DISK_START_LBA) conv=notrunc status=none
+	rm -f $(DISK_PART)
+
+image: build $(DISK_IMG)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot/grub $(BUILD_DIR)
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL64) $(ISO_ROOT)/boot/rinux.elf

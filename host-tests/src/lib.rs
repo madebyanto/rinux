@@ -4,6 +4,8 @@ pub mod frame;
 pub mod heap;
 #[path = "../../src/drivers/ps2.rs"]
 pub mod ps2;
+#[path = "../../src/drivers/ata.rs"]
+pub mod ata;
 #[path = "../../src/proc/pid.rs"]
 pub mod pid;
 #[path = "../../src/proc/queue.rs"]

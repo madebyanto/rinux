@@ -17,7 +17,7 @@ use arch::x86_64::cpu;
 use arch::x86_64::multiboot2::BootInfo;
 use arch::x86_64::{gdt, idt, pic, pit, serial, vga};
 use core::panic::PanicInfo;
-use drivers::ps2;
+use drivers::{ata, ps2};
 use proc::scheduler;
 
 const TASK_REPORT_INTERVAL_MS: u64 = 300;
@@ -56,6 +56,15 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     if let Err(error) = ps2::init() {
         fatal("PS/2 initialization failed", error);
     }
+    let ata_info = match ata::init() {
+        Ok(info) => info,
+        Err(error) => fatal("ATA initialization failed", error),
+    };
+    let mut mbr_sector = [0u8; 512];
+    if let Err(error) = ata::read_sectors(0, 1, &mut mbr_sector) {
+        fatal("ATA MBR sector read failed", error);
+    }
+    let mbr_found = mbr_sector[510] == 0x55 && mbr_sector[511] == 0xAA;
     if let Err(error) = scheduler::init() {
         fatal("scheduler initialization failed", error);
     }
@@ -89,6 +98,20 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     kprintln!("IDT loaded with 256 entries");
     kprintln!("PIT configured at {} Hz", pit::FREQUENCY_HZ);
     kprintln!("PS/2 keyboard ready on IRQ1 (scancode set 1)");
+    kprintln!(
+        "ata: {}, {} sectors (LBA28, LBA48 {})",
+        ata_info.model(),
+        ata_info.sectors,
+        if ata_info.lba48 {
+            "supported"
+        } else {
+            "not supported"
+        }
+    );
+    kprintln!(
+        "ata: MBR signature 0x55AA {}",
+        if mbr_found { "found" } else { "not found" }
+    );
     kprintln!(
         "gdt: kernel CS/SS {:#x}/{:#x}, user CS/SS {:#x}/{:#x}, TSS {:#x}",
         gdt::KERNEL_CODE,
