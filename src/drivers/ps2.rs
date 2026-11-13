@@ -260,6 +260,7 @@ pub fn handle_interrupt() {
     }
     let scancode = unsafe { inb(DATA_PORT) };
     KEYBOARD.lock().handle_scancode(scancode);
+    crate::proc::scheduler::wake_keyboard_waiter();
 }
 
 #[cfg(target_os = "none")]

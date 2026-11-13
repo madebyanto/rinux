@@ -34,3 +34,18 @@ task_start:
     cli
     call task_finished
     hlt
+
+.global user_task_start
+user_task_start:
+    push r15
+    push r13
+    push rbp
+    push r14
+    push r12
+    xor ebx, ebx
+    xor ebp, ebp
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+    iretq

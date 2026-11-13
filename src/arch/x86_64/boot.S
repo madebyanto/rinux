@@ -27,8 +27,10 @@ p1_table:
 .skip 4096
 .align 16
 stack_bottom:
-.skip 16384
+.skip 65536
 stack_top:
+.global boot_stack_top
+boot_stack_top:
 
 .section .rodata, "a"
 .align 8

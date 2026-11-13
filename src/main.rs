@@ -8,12 +8,14 @@ mod drivers;
 mod mm;
 mod proc;
 mod sync;
+mod syscall;
+mod user;
 
 extern crate alloc;
 
 use arch::x86_64::cpu;
 use arch::x86_64::multiboot2::BootInfo;
-use arch::x86_64::{idt, pic, pit, serial, vga};
+use arch::x86_64::{gdt, idt, pic, pit, serial, vga};
 use core::panic::PanicInfo;
 use drivers::ps2;
 use proc::scheduler;
@@ -39,6 +41,9 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     mm::self_test();
     kprintln!("memory subsystem ready");
 
+    gdt::init();
+    arch::x86_64::syscall::init();
+
     pic::remap();
     idt::init();
     if let Err(error) = idt::register_irq(0, pit::handle_tick) {
@@ -63,6 +68,13 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     if let Err(error) = scheduler::spawn(task_three) {
         fatal("task 3 spawn failed", error);
     }
+    let image = match user::init() {
+        Ok(image) => image,
+        Err(error) => fatal("user image setup failed", error),
+    };
+    if let Err(error) = scheduler::spawn_user(image.entry, image.stack_top, image.pages) {
+        fatal("user task spawn failed", error);
+    }
     if let Err(error) = pic::unmask(0) {
         fatal("PIT IRQ unmask failed", error);
     }
@@ -77,6 +89,26 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     kprintln!("IDT loaded with 256 entries");
     kprintln!("PIT configured at {} Hz", pit::FREQUENCY_HZ);
     kprintln!("PS/2 keyboard ready on IRQ1 (scancode set 1)");
+    kprintln!(
+        "gdt: kernel CS/SS {:#x}/{:#x}, user CS/SS {:#x}/{:#x}, TSS {:#x}",
+        gdt::KERNEL_CODE,
+        gdt::KERNEL_DATA,
+        gdt::USER_CODE_RPL3,
+        gdt::USER_DATA_RPL3,
+        gdt::TSS_SELECTOR
+    );
+    kprintln!(
+        "syscall: SCE=1 LSTAR={:#x} STAR={:#x} FMASK={:#x}",
+        arch::x86_64::syscall::lstar(),
+        arch::x86_64::syscall::star_value(),
+        arch::x86_64::syscall::fmask_value()
+    );
+    kprintln!(
+        "user: {} byte blob at {:#x}, stack top {:#x}",
+        user::blob_len(),
+        user::PROGRAM_BASE,
+        user::STACK_TOP
+    );
     kprintln!(
         "scheduler: round-robin, {} tasks ({} ready), timeslice {} ms ({} ticks)",
         scheduler::task_count(),

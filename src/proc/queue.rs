@@ -38,6 +38,19 @@ impl ReadyQueue {
         Ok(())
     }
 
+    pub fn push_front(&mut self, pid: Pid) -> Result<(), QueueError> {
+        if self.contains(pid) {
+            return Err(QueueError::AlreadyQueued);
+        }
+        if self.len == MAX_PROCESSES {
+            return Err(QueueError::Full);
+        }
+        self.head = (self.head + MAX_PROCESSES - 1) % MAX_PROCESSES;
+        self.entries[self.head] = Some(pid);
+        self.len += 1;
+        Ok(())
+    }
+
     pub fn pop(&mut self) -> Option<Pid> {
         if self.len == 0 {
             return None;

@@ -8,3 +8,11 @@ pub mod ps2;
 pub mod pid;
 #[path = "../../src/proc/queue.rs"]
 pub mod queue;
+#[path = "../../src/proc/reap.rs"]
+pub mod reap;
+#[path = "../../src/user/range.rs"]
+pub mod user_range;
+#[path = "../../src/syscall/abi.rs"]
+pub mod syscall_abi;
+#[path = "../../src/arch/x86_64/descriptor.rs"]
+pub mod descriptor;

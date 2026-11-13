@@ -72,6 +72,20 @@ fn ready_queue_wraps_and_preserves_order() {
 }
 
 #[test]
+fn ready_queue_push_front_jumps_ahead() {
+    let mut queue = ReadyQueue::new();
+    queue.push(1).unwrap();
+    queue.push(2).unwrap();
+    queue.push_front(3).unwrap();
+    assert_eq!(queue.push_front(1), Err(QueueError::AlreadyQueued));
+    assert_eq!(queue.len(), 3);
+    assert_eq!(queue.pop(), Some(3));
+    assert_eq!(queue.pop(), Some(1));
+    assert_eq!(queue.pop(), Some(2));
+    assert_eq!(queue.pop(), None);
+}
+
+#[test]
 fn ready_queue_removes_any_position() {
     let mut queue = ReadyQueue::new();
     for pid in 0..5 {

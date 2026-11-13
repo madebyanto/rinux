@@ -6,11 +6,15 @@ struct Console;
 impl Write for Console {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         for byte in text.bytes() {
-            serial::write_byte(byte);
-            vga::write_byte(byte);
+            write_byte(byte);
         }
         Ok(())
     }
+}
+
+pub fn write_byte(byte: u8) {
+    serial::write_byte(byte);
+    vga::write_byte(byte);
 }
 
 pub fn print(args: fmt::Arguments) {

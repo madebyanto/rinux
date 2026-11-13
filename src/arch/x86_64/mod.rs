@@ -1,9 +1,12 @@
 pub mod boot;
 pub mod cpu;
+pub mod descriptor;
+pub mod gdt;
 pub mod idt;
 pub mod multiboot2;
 pub mod pic;
 pub mod pit;
 pub mod port;
 pub mod serial;
+pub mod syscall;
 pub mod vga;
