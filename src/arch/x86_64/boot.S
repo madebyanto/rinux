@@ -27,7 +27,7 @@ p1_table:
 .skip 4096
 .align 16
 stack_bottom:
-.skip 65536
+.skip 262144
 stack_top:
 .global boot_stack_top
 boot_stack_top:

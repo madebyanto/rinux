@@ -6,6 +6,7 @@ pub const MAX_FDS: usize = 16;
 pub enum FdError {
     InvalidFd,
     NoFreeFd,
+    NoProcess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

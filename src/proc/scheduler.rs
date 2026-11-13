@@ -1,10 +1,13 @@
 use super::context::{self, Context};
 use super::pid::{Pid, PidAllocator};
-use super::process::{free_user_pages, Process, ProcessState, TaskEntry, UserPage};
+use super::process::{Process, ProcessState, TaskEntry};
 use super::queue::{ReadyQueue, MAX_PROCESSES};
 use super::reap::ReapList;
 use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::gdt;
+use crate::fs::fd::{FdEntry, FdError};
+use crate::mm::address_space::AddressSpace;
+use crate::mm::paging;
 use crate::sync::SpinLock;
 
 pub const TIMESLICE_TICKS: u32 = 10;
@@ -102,7 +105,7 @@ pub fn spawn(entry: TaskEntry) -> Result<Pid, SpawnError> {
 pub fn spawn_user(
     entry: u64,
     stack_top: u64,
-    pages: alloc::vec::Vec<UserPage>,
+    address_space: AddressSpace,
 ) -> Result<Pid, SpawnError> {
     cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
@@ -116,13 +119,11 @@ pub fn spawn_user(
             .pids
             .allocate()
             .map_err(|_| SpawnError::PidExhausted)?;
-        let process =
-            Process::new_user(pid, entry, stack_top, pages).map_err(|_| SpawnError::OutOfMemory)?;
+        let process = Process::new_user(pid, entry, stack_top, address_space)
+            .map_err(|_| SpawnError::OutOfMemory)?;
         scheduler.processes[slot] = Some(process);
         if scheduler.ready.push(pid).is_err() {
-            if let Some(mut process) = scheduler.processes[slot].take() {
-                free_user_pages(&mut process.user_pages);
-            }
+            scheduler.processes[slot] = None;
             return Err(SpawnError::QueueFull);
         }
         Ok(pid)
@@ -158,6 +159,51 @@ pub fn current_pid() -> Option<Pid> {
     cpu::without_interrupts(|| {
         let guard = SCHEDULER.lock();
         guard.as_ref().and_then(|scheduler| scheduler.current)
+    })
+}
+
+pub fn current_fd_entry(fd: u32) -> Result<FdEntry, FdError> {
+    cpu::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let scheduler = guard.as_ref().ok_or(FdError::NoProcess)?;
+        let pid = scheduler.current.ok_or(FdError::NoProcess)?;
+        let process = scheduler
+            .processes
+            .iter()
+            .flatten()
+            .find(|process| process.pid == pid)
+            .ok_or(FdError::NoProcess)?;
+        process.fds.entry(fd)
+    })
+}
+
+pub fn current_open_fd(node: u32) -> Result<u32, FdError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(FdError::NoProcess)?;
+        let pid = scheduler.current.ok_or(FdError::NoProcess)?;
+        let process = scheduler.process_mut(pid).ok_or(FdError::NoProcess)?;
+        process.fds.open_file(node)
+    })
+}
+
+pub fn current_close_fd(fd: u32) -> Result<(), FdError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(FdError::NoProcess)?;
+        let pid = scheduler.current.ok_or(FdError::NoProcess)?;
+        let process = scheduler.process_mut(pid).ok_or(FdError::NoProcess)?;
+        process.fds.close(fd)
+    })
+}
+
+pub fn current_set_fd_offset(fd: u32, offset: u64) -> Result<(), FdError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(FdError::NoProcess)?;
+        let pid = scheduler.current.ok_or(FdError::NoProcess)?;
+        let process = scheduler.process_mut(pid).ok_or(FdError::NoProcess)?;
+        process.fds.set_offset(fd, offset)
     })
 }
 
@@ -264,7 +310,7 @@ pub fn exit_current(code: i32) -> ! {
 }
 
 fn schedule() {
-    let (old_context, new_context, next_top) = {
+    let (old_context, new_context, next_top, next_root) = {
         let mut guard = SCHEDULER.lock();
         let Some(scheduler) = guard.as_mut() else {
             return;
@@ -277,9 +323,7 @@ fn schedule() {
                 .iter()
                 .position(|process| process.as_ref().map_or(false, |process| process.pid == pid));
             if let Some(slot) = slot {
-                if let Some(mut process) = scheduler.processes[slot].take() {
-                    free_user_pages(&mut process.user_pages);
-                }
+                let _ = scheduler.processes[slot].take();
             }
         }
 
@@ -306,33 +350,40 @@ fn schedule() {
             None => core::ptr::addr_of_mut!(scheduler.idle_context),
         };
 
-        let (new_context, next_top) = match next {
+        let (new_context, next_top, next_root) = match next {
             Some(pid) => match scheduler.process_mut(pid) {
                 Some(process) => {
                     process.state = ProcessState::Running;
                     let context = core::ptr::addr_of_mut!(process.context);
                     let top = process.kernel_stack_top;
+                    let root = process.address_space.root();
                     scheduler.current = Some(pid);
-                    (context, top)
+                    (context, top, root)
                 }
                 None => (
                     core::ptr::addr_of_mut!(scheduler.idle_context),
                     scheduler.idle_stack_top,
+                    paging::kernel_root(),
                 ),
             },
             None => (
                 core::ptr::addr_of_mut!(scheduler.idle_context),
                 scheduler.idle_stack_top,
+                paging::kernel_root(),
             ),
         };
 
-        (old_context, new_context, next_top)
+        (old_context, new_context, next_top, next_root)
     };
 
     gdt::set_rsp0(next_top);
 
     if old_context == new_context {
         return;
+    }
+
+    if next_root != paging::active_root() {
+        cpu::write_cr3(next_root);
     }
 
     unsafe { context::switch(old_context, new_context) };

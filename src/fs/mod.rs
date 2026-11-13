@@ -8,11 +8,9 @@ use crate::sync::SpinLock;
 use alloc::boxed::Box;
 use alloc::string::String;
 use ext2::{BlockDevice, Ext2, Ext2Error};
-use fd::{FdEntry, FdError, FdTable};
 use vfs::{DirCursor, DirEntry, File, NodeId, Stat, Vfs, VfsError};
 
 static VFS: SpinLock<Option<Vfs>> = SpinLock::new(None);
-static FDS: SpinLock<Option<FdTable>> = SpinLock::new(None);
 
 pub struct MountInfo {
     pub partition: mbr::Partition,
@@ -52,24 +50,6 @@ impl core::fmt::Display for MountError {
             }
             MountError::Ext2(error) => write!(formatter, "{}", error),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsError {
-    Vfs(VfsError),
-    Fd(FdError),
-}
-
-impl From<VfsError> for FsError {
-    fn from(error: VfsError) -> Self {
-        FsError::Vfs(error)
-    }
-}
-
-impl From<FdError> for FsError {
-    fn from(error: FdError) -> Self {
-        FsError::Fd(error)
     }
 }
 
@@ -119,14 +99,8 @@ pub fn mount(disk_sectors: u32) -> Result<MountInfo, MountError> {
         inodes: filesystem.superblock().inodes_count(),
         blocks: filesystem.superblock().blocks_count(),
     };
-    {
-        let mut vfs = VFS.lock();
-        *vfs = Some(Vfs::new(Box::new(filesystem)));
-    }
-    {
-        let mut fds = FDS.lock();
-        *fds = Some(FdTable::new());
-    }
+    let mut vfs = VFS.lock();
+    *vfs = Some(Vfs::new(Box::new(filesystem)));
     Ok(info)
 }
 
@@ -166,57 +140,8 @@ pub fn read_node(node: NodeId, offset: u64, buffer: &mut [u8]) -> Result<usize, 
     vfs.read_at(node, offset, buffer)
 }
 
-pub fn open_fd(path: &str) -> Result<u32, FsError> {
-    let node = {
-        let mut guard = VFS.lock();
-        let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
-        vfs.open(path)?.node
-    };
-    let mut guard = FDS.lock();
-    let table = guard.as_mut().ok_or(VfsError::NotMounted)?;
-    Ok(table.open_file(node)?)
-}
-
-pub fn close_fd(fd: u32) -> Result<(), FsError> {
-    let mut guard = FDS.lock();
-    let table = guard.as_mut().ok_or(VfsError::NotMounted)?;
-    Ok(table.close(fd)?)
-}
-
-pub fn fd_entry(fd: u32) -> Result<FdEntry, FsError> {
-    let guard = FDS.lock();
-    let table = guard.as_ref().ok_or(VfsError::NotMounted)?;
-    Ok(table.entry(fd)?)
-}
-
-pub fn set_fd_offset(fd: u32, offset: u64) -> Result<(), FsError> {
-    let mut guard = FDS.lock();
-    let table = guard.as_mut().ok_or(VfsError::NotMounted)?;
-    Ok(table.set_offset(fd, offset)?)
-}
-
-pub fn read_file_fd(fd: u32, buffer: &mut [u8]) -> Result<usize, FsError> {
-    let file = match fd_entry(fd)? {
-        FdEntry::File(file) => file,
-        _ => return Err(FsError::Vfs(VfsError::NotFile)),
-    };
-    let count = read_node(file.node, file.offset, buffer)?;
-    if count > 0 {
-        set_fd_offset(fd, file.offset + count as u64)?;
-    }
-    Ok(count)
-}
-
-pub fn seek_fd(fd: u32, offset: i64, whence: u8) -> Result<u64, FsError> {
-    let mut file = match fd_entry(fd)? {
-        FdEntry::File(file) => file,
-        _ => return Err(FsError::Vfs(VfsError::NotFile)),
-    };
-    let new_offset = {
-        let mut guard = VFS.lock();
-        let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
-        vfs.seek(&mut file, offset, whence)?
-    };
-    set_fd_offset(fd, new_offset)?;
-    Ok(new_offset)
+pub fn seek(file: &mut File, offset: i64, whence: u8) -> Result<u64, VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.seek(file, offset, whence)
 }

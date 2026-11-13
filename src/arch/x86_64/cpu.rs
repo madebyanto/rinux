@@ -65,6 +65,12 @@ pub fn read_cr3() -> u64 {
     value
 }
 
+pub fn write_cr3(value: usize) {
+    unsafe {
+        asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
 pub fn invlpg(address: usize) {
     unsafe {
         asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));

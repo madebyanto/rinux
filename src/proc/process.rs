@@ -1,6 +1,7 @@
 use super::context::{self, Context, KERNEL_STACK_SIZE};
 use super::pid::Pid;
-use crate::mm::{deallocate_frame, paging};
+use crate::fs::fd::FdTable;
+use crate::mm::address_space::AddressSpace;
 use alloc::vec::Vec;
 
 pub type TaskEntry = extern "C" fn();
@@ -19,12 +20,6 @@ pub enum ProcessError {
     OutOfMemory,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct UserPage {
-    pub virt: usize,
-    pub phys: usize,
-}
-
 pub struct Process {
     pub pid: Pid,
     pub state: ProcessState,
@@ -32,7 +27,8 @@ pub struct Process {
     pub kernel_stack: Vec<u8>,
     pub kernel_stack_top: u64,
     pub context: Context,
-    pub user_pages: Vec<UserPage>,
+    pub address_space: AddressSpace,
+    pub fds: FdTable,
     #[allow(dead_code)]
     pub exit_code: Option<i32>,
 }
@@ -49,6 +45,7 @@ impl Process {
     }
 
     pub fn new(pid: Pid, entry: TaskEntry) -> Result<Self, ProcessError> {
+        let address_space = AddressSpace::new().map_err(|_| ProcessError::OutOfMemory)?;
         let (mut kernel_stack, kernel_stack_top) = Self::allocate_stack()?;
         let context = context::prepare_stack(&mut kernel_stack, entry);
         Ok(Self {
@@ -57,7 +54,8 @@ impl Process {
             kernel_stack,
             kernel_stack_top,
             context,
-            user_pages: Vec::new(),
+            address_space,
+            fds: FdTable::new(),
             exit_code: None,
         })
     }
@@ -66,15 +64,9 @@ impl Process {
         pid: Pid,
         entry: u64,
         stack_top: u64,
-        mut user_pages: Vec<UserPage>,
+        address_space: AddressSpace,
     ) -> Result<Self, ProcessError> {
-        let (mut kernel_stack, kernel_stack_top) = match Self::allocate_stack() {
-            Ok(stack) => stack,
-            Err(error) => {
-                free_user_pages(&mut user_pages);
-                return Err(error);
-            }
-        };
+        let (mut kernel_stack, kernel_stack_top) = Self::allocate_stack()?;
         let context = context::prepare_user_stack(&mut kernel_stack, entry, stack_top);
         Ok(Self {
             pid,
@@ -82,21 +74,9 @@ impl Process {
             kernel_stack,
             kernel_stack_top,
             context,
-            user_pages,
+            address_space,
+            fds: FdTable::new(),
             exit_code: None,
         })
-    }
-}
-
-pub fn free_user_pages(pages: &mut Vec<UserPage>) {
-    for page in pages.drain(..) {
-        match paging::unmap(page.virt) {
-            Ok(phys) => {
-                let _ = deallocate_frame(phys);
-            }
-            Err(_) => {
-                let _ = deallocate_frame(page.phys);
-            }
-        }
     }
 }

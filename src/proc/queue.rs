@@ -1,6 +1,6 @@
 use super::pid::Pid;
 
-pub const MAX_PROCESSES: usize = 16;
+pub const MAX_PROCESSES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {

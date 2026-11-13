@@ -6,7 +6,6 @@ use crate::drivers::ps2;
 use crate::fs;
 use crate::fs::fd::{FdEntry, FdError};
 use crate::fs::vfs::{FileType, VfsError};
-use crate::fs::FsError;
 use crate::proc::scheduler;
 use crate::user;
 use alloc::string::String;
@@ -49,9 +48,9 @@ pub extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
 }
 
 fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
-    let entry = match fs::fd_entry(fd as u32) {
+    let entry = match scheduler::current_fd_entry(fd as u32) {
         Ok(entry) => entry,
-        Err(error) => return fs_errno(error),
+        Err(error) => return fd_errno(error),
     };
     match entry {
         FdEntry::Keyboard => {
@@ -72,7 +71,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
             }
         }
         FdEntry::Console => abi::errno(abi::EINVAL),
-        FdEntry::File(_) => {
+        FdEntry::File(file) => {
             if len == 0 {
                 return 0;
             }
@@ -84,18 +83,26 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
                 return abi::errno(abi::EFAULT);
             }
             let buffer = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-            match fs::read_file_fd(fd as u32, buffer) {
-                Ok(count) => count as u64,
-                Err(error) => fs_errno(error),
+            let count = match fs::read_node(file.node, file.offset, buffer) {
+                Ok(count) => count,
+                Err(error) => return vfs_errno(error),
+            };
+            if count > 0 {
+                if let Err(error) =
+                    scheduler::current_set_fd_offset(fd as u32, file.offset + count as u64)
+                {
+                    return fd_errno(error);
+                }
             }
+            count as u64
         }
     }
 }
 
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
-    let entry = match fs::fd_entry(fd as u32) {
+    let entry = match scheduler::current_fd_entry(fd as u32) {
         Ok(entry) => entry,
-        Err(error) => return fs_errno(error),
+        Err(error) => return fd_errno(error),
     };
     match entry {
         FdEntry::Console => {
@@ -128,16 +135,20 @@ fn sys_open(path: u64, flags: u64, _mode: u64) -> u64 {
         Ok(path) => path,
         Err(error) => return error,
     };
-    match fs::open_fd(&path) {
+    let file = match fs::open(&path) {
+        Ok(file) => file,
+        Err(error) => return vfs_errno(error),
+    };
+    match scheduler::current_open_fd(file.node) {
         Ok(fd) => fd as u64,
-        Err(error) => fs_errno(error),
+        Err(error) => fd_errno(error),
     }
 }
 
 fn sys_close(fd: u64) -> u64 {
-    match fs::close_fd(fd as u32) {
+    match scheduler::current_close_fd(fd as u32) {
         Ok(()) => 0,
-        Err(error) => fs_errno(error),
+        Err(error) => fd_errno(error),
     }
 }
 
@@ -170,9 +181,18 @@ fn sys_stat(path: u64, buffer: u64) -> u64 {
 }
 
 fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    match fs::seek_fd(fd as u32, offset as i64, whence as u8) {
+    let mut file = match scheduler::current_fd_entry(fd as u32) {
+        Ok(FdEntry::File(file)) => file,
+        Ok(_) => return abi::errno(abi::EINVAL),
+        Err(error) => return fd_errno(error),
+    };
+    let new_offset = match fs::seek(&mut file, offset as i64, whence as u8) {
         Ok(offset) => offset,
-        Err(error) => fs_errno(error),
+        Err(error) => return vfs_errno(error),
+    };
+    match scheduler::current_set_fd_offset(fd as u32, new_offset) {
+        Ok(()) => new_offset,
+        Err(error) => fd_errno(error),
     }
 }
 
@@ -207,11 +227,10 @@ fn user_path(pointer: u64) -> Result<String, u64> {
     Err(abi::errno(abi::ENAMETOOLONG))
 }
 
-fn fs_errno(error: FsError) -> u64 {
+fn fd_errno(error: FdError) -> u64 {
     match error {
-        FsError::Fd(FdError::InvalidFd) => abi::errno(abi::EBADF),
-        FsError::Fd(FdError::NoFreeFd) => abi::errno(abi::EMFILE),
-        FsError::Vfs(error) => vfs_errno(error),
+        FdError::InvalidFd | FdError::NoProcess => abi::errno(abi::EBADF),
+        FdError::NoFreeFd => abi::errno(abi::EMFILE),
     }
 }
 

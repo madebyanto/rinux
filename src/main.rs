@@ -84,7 +84,7 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
         Ok(image) => image,
         Err(error) => fatal("user image setup failed", error),
     };
-    if let Err(error) = scheduler::spawn_user(image.entry, image.stack_top, image.pages) {
+    if let Err(error) = scheduler::spawn_user(image.entry, image.stack_top, image.address_space) {
         fatal("user task spawn failed", error);
     }
     if let Err(error) = pic::unmask(0) {
@@ -251,32 +251,6 @@ fn mount_and_demo(disk_sectors: u32) {
             Err(error) => fatal_display("ext2 read failed", error),
         }
     }
-    match fd_self_test() {
-        Ok(()) => kprintln!("ext2: fd self-test ok"),
-        Err(error) => fatal_display("ext2 fd self-test failed", error),
-    }
-}
-
-fn fd_self_test() -> Result<(), &'static str> {
-    let fd = fs::open_fd("/hello.txt").map_err(|_| "open")?;
-    let mut buffer = [0u8; 32];
-    let count = fs::read_file_fd(fd, &mut buffer).map_err(|_| "read")?;
-    if &buffer[..count] != b"hello from ext2\n" {
-        return Err("read content");
-    }
-    if fs::seek_fd(fd, 6, 0).map_err(|_| "seek")? != 6 {
-        return Err("seek offset");
-    }
-    let count = fs::read_file_fd(fd, &mut buffer).map_err(|_| "read after seek")?;
-    if &buffer[..count] != b"from ext2\n" {
-        return Err("read after seek content");
-    }
-    let stat = fs::stat_path("/hello.txt").map_err(|_| "stat")?;
-    if stat.size != 16 {
-        return Err("stat size");
-    }
-    fs::close_fd(fd).map_err(|_| "close")?;
-    Ok(())
 }
 
 fn fatal_display(context: &str, error: impl core::fmt::Display) -> ! {

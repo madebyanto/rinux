@@ -1,3 +1,4 @@
+pub mod address_space;
 pub mod frame;
 pub mod heap;
 pub mod paging;
@@ -41,6 +42,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
 static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 pub fn init(boot: &BootInfo) {
+    paging::init_kernel_root();
     let kernel_start = addr_of!(__kernel_start) as usize;
     let kernel_end = addr_of!(__kernel_end) as usize;
     let (info_start, info_end) = boot.info_range();

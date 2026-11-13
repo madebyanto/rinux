@@ -24,3 +24,13 @@ pub fn stack_valid(address: usize, length: usize) -> bool {
 pub fn range_valid(address: usize, length: usize) -> bool {
     program_valid(address, length) || stack_valid(address, length)
 }
+
+pub const PML4_SHIFT: usize = 39;
+pub const USER_PML4_INDEX: usize = 1;
+
+pub const fn pml4_index(address: usize) -> usize {
+    address >> PML4_SHIFT
+}
+
+const _: () = assert!(pml4_index(PROGRAM_BASE) == USER_PML4_INDEX);
+const _: () = assert!(pml4_index(STACK_TOP - 1) == USER_PML4_INDEX);
