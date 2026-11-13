@@ -10,7 +10,9 @@ while true; do
     echo "1) Compile only"
     echo "2) Run existing image"
     echo "3) Compile and run"
-    echo "4) Exit"
+    echo "4) Mount file system"
+    echo "5) Umount file system"
+    echo "6) Exit"
     echo
     read -rp "Choice: " choice
     echo
@@ -35,6 +37,12 @@ while true; do
             make run
             ;;
         4)
+            sudo losetup -P -f --show build/disk.img   
+            ;;
+        5)
+            sudo losetup -d /dev/loop0
+            ;;
+        6)
             exit 0
             ;;
         *)
