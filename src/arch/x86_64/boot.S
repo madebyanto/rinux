@@ -23,6 +23,8 @@ p3_table:
 .skip 4096
 p2_table:
 .skip 4096
+p1_table:
+.skip 4096
 .align 16
 stack_bottom:
 .skip 16384
@@ -42,6 +44,7 @@ gdt64_pointer:
 .code32
 .global _start
 _start:
+cli
 mov esp, offset stack_top
 mov esi, ebx
 cmp eax, 0x36D76289
@@ -81,7 +84,7 @@ ret
 
 boot_setup_page_tables:
 mov edi, offset p4_table
-mov ecx, 3072
+mov ecx, 4096
 xor eax, eax
 rep stosd
 
@@ -93,7 +96,21 @@ mov eax, offset p2_table
 or eax, 3
 mov dword ptr [p3_table], eax
 
-xor ecx, ecx
+mov eax, offset p1_table
+or eax, 3
+mov dword ptr [p2_table], eax
+
+mov ecx, 1
+boot_map_p1_loop:
+mov eax, ecx
+shl eax, 12
+or eax, 3
+mov dword ptr [p1_table + ecx*8], eax
+inc ecx
+cmp ecx, 512
+jne boot_map_p1_loop
+
+mov ecx, 1
 boot_map_p2_loop:
 mov eax, ecx
 shl eax, 21

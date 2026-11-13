@@ -33,3 +33,4 @@ check:
 clean:
 	cargo clean
 	rm -rf $(BUILD_DIR)
+	$(MAKE) -C host-tests clean

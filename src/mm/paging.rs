@@ -5,6 +5,7 @@ use core::ptr::{read_volatile, write_bytes, write_volatile};
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
+pub const USER: u64 = 1 << 2;
 const HUGE_PAGE: u64 = 1 << 7;
 const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const ENTRY_COUNT: usize = 512;
@@ -19,6 +20,10 @@ pub enum MapError {
     OutOfFrames,
 }
 
+/// Maps a 4 KiB page.
+///
+/// The caller must hold the mm spinlock: the page walk is a read-modify-write
+/// sequence and is not reentrant.
 pub fn map(virt: usize, phys: usize, flags: u64) -> Result<(), MapError> {
     if virt % FRAME_SIZE != 0 || phys % FRAME_SIZE != 0 {
         return Err(MapError::Misaligned);
@@ -29,7 +34,7 @@ pub fn map(virt: usize, phys: usize, flags: u64) -> Result<(), MapError> {
         let entry = read_entry(slot);
         table = if (entry & PRESENT) == 0 {
             let child = new_table().ok_or(MapError::OutOfFrames)?;
-            write_entry(slot, child as u64 | PRESENT | WRITABLE);
+            write_entry(slot, child as u64 | PRESENT | WRITABLE | (flags & USER));
             child
         } else if (entry & HUGE_PAGE) != 0 {
             return Err(MapError::HugePageConflict);
@@ -46,6 +51,10 @@ pub fn map(virt: usize, phys: usize, flags: u64) -> Result<(), MapError> {
     Ok(())
 }
 
+/// Removes a 4 KiB page mapping.
+///
+/// The caller must hold the mm spinlock: the page walk is a read-modify-write
+/// sequence and is not reentrant.
 pub fn unmap(virt: usize) -> Result<usize, MapError> {
     let slot = leaf_slot(virt)?;
     let entry = read_entry(slot);

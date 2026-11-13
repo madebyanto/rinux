@@ -1,3 +1,4 @@
 /target
 /build
 /.kilo
+host-tests/target
