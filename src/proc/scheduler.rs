@@ -3,8 +3,11 @@ use super::pid::{Pid, PidAllocator};
 use super::process::{Process, ProcessState, TaskEntry};
 use super::queue::{ReadyQueue, MAX_PROCESSES};
 use super::reap::ReapList;
+use super::wait::WaitTarget;
+use super::wait_queue::{PidQueue, QueueError};
 use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::gdt;
+use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::fs::fd::{FdEntry, FdError};
 use crate::mm::address_space::AddressSpace;
 use crate::mm::paging;
@@ -18,6 +21,7 @@ pub enum SchedulerError {
     AlreadyInitialized,
     NotInitialized,
     NoCurrentProcess,
+    KeyboardQueueFull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,22 @@ pub enum SpawnError {
     QueueFull,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkError {
+    NoCurrent,
+    NoFreeSlot,
+    PidExhausted,
+    OutOfMemory,
+    QueueFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitResult {
+    Reaped(Pid, i32),
+    Block,
+    NoChild,
+}
+
 struct Scheduler {
     processes: [Option<Process>; MAX_PROCESSES],
     ready: ReadyQueue,
@@ -37,7 +57,7 @@ struct Scheduler {
     idle_stack_top: u64,
     pids: PidAllocator,
     reap: ReapList,
-    keyboard_waiter: Option<Pid>,
+    keyboard_waiters: PidQueue,
     ticks_remaining: u32,
     timeslice_ticks: u32,
 }
@@ -54,7 +74,7 @@ impl Scheduler {
             idle_stack_top: gdt::boot_stack_top(),
             pids: PidAllocator::new(),
             reap: ReapList::new(),
-            keyboard_waiter: None,
+            keyboard_waiters: PidQueue::new(),
             ticks_remaining: timeslice_ticks,
             timeslice_ticks,
         }
@@ -130,6 +150,43 @@ pub fn spawn_user(
     })
 }
 
+pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(ForkError::NoCurrent)?;
+        let parent_pid = scheduler.current.ok_or(ForkError::NoCurrent)?;
+        let (address_space, fds) = {
+            let parent = scheduler
+                .process_mut(parent_pid)
+                .ok_or(ForkError::NoCurrent)?;
+            let address_space = parent
+                .address_space
+                .clone_user()
+                .map_err(|_| ForkError::OutOfMemory)?;
+            (address_space, parent.fds.clone())
+        };
+        let slot = scheduler
+            .processes
+            .iter()
+            .position(|process| process.is_none())
+            .ok_or(ForkError::NoFreeSlot)?;
+        let pid = match scheduler.pids.allocate() {
+            Ok(pid) => pid,
+            Err(_) => {
+                return Err(ForkError::PidExhausted);
+            }
+        };
+        let process = Process::new_fork(pid, parent_pid, address_space, fds, frame)
+            .map_err(|_| ForkError::OutOfMemory)?;
+        scheduler.processes[slot] = Some(process);
+        if scheduler.ready.push(pid).is_err() {
+            scheduler.processes[slot] = None;
+            return Err(ForkError::QueueFull);
+        }
+        Ok(pid)
+    })
+}
+
 pub fn task_count() -> usize {
     cpu::without_interrupts(|| {
         let guard = SCHEDULER.lock();
@@ -138,7 +195,7 @@ pub fn task_count() -> usize {
                 .processes
                 .iter()
                 .flatten()
-                .filter(|process| process.state != ProcessState::Terminated)
+                .filter(|process| process.state != ProcessState::Zombie)
                 .count(),
             None => 0,
         }
@@ -207,6 +264,90 @@ pub fn current_set_fd_offset(fd: u32, offset: u64) -> Result<(), FdError> {
     })
 }
 
+pub fn replace_address_space(new: AddressSpace) -> Result<AddressSpace, SchedulerError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SchedulerError::NotInitialized)?;
+        let pid = scheduler.current.ok_or(SchedulerError::NoCurrentProcess)?;
+        let process = scheduler
+            .process_mut(pid)
+            .ok_or(SchedulerError::NoCurrentProcess)?;
+        Ok(core::mem::replace(&mut process.address_space, new))
+    })
+}
+
+pub fn try_wait(target: WaitTarget) -> WaitResult {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = match guard.as_mut() {
+            Some(scheduler) => scheduler,
+            None => return WaitResult::NoChild,
+        };
+        let parent = match scheduler.current {
+            Some(parent) => parent,
+            None => return WaitResult::NoChild,
+        };
+        let mut matched = false;
+        let mut reap = None;
+        for (index, process) in scheduler.processes.iter().enumerate() {
+            let Some(process) = process else {
+                continue;
+            };
+            if process.parent != Some(parent) || !target.matches(process.pid) {
+                continue;
+            }
+            matched = true;
+            if process.state == ProcessState::Zombie {
+                reap = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = reap {
+            let pid = scheduler.processes[index]
+                .as_ref()
+                .map(|process| process.pid)
+                .unwrap_or(0);
+            let code = scheduler.processes[index]
+                .as_ref()
+                .and_then(|process| process.exit_code)
+                .unwrap_or(0);
+            let _ = scheduler.processes[index].take();
+            WaitResult::Reaped(pid, code)
+        } else if matched {
+            WaitResult::Block
+        } else {
+            WaitResult::NoChild
+        }
+    })
+}
+
+pub fn block_on_child(target: WaitTarget) -> Result<(), SchedulerError> {
+    let flags = cpu::read_rflags();
+    cpu::disable_interrupts();
+    let result = {
+        let mut guard = SCHEDULER.lock();
+        match guard.as_mut() {
+            Some(scheduler) => match scheduler.current {
+                Some(pid) => match scheduler.process_mut(pid) {
+                    Some(process) => {
+                        process.state = ProcessState::Blocked;
+                        process.waiting_for = Some(target);
+                        Ok(())
+                    }
+                    None => Err(SchedulerError::NoCurrentProcess),
+                },
+                None => Err(SchedulerError::NoCurrentProcess),
+            },
+            None => Err(SchedulerError::NotInitialized),
+        }
+    };
+    if result.is_ok() {
+        schedule();
+    }
+    cpu::restore_rflags(flags);
+    result
+}
+
 pub fn yield_now() {
     let flags = cpu::read_rflags();
     cpu::disable_interrupts();
@@ -242,21 +383,20 @@ pub fn block_on_keyboard() -> Result<(), SchedulerError> {
         let mut guard = SCHEDULER.lock();
         match guard.as_mut() {
             Some(scheduler) => match scheduler.current {
-                Some(pid) => {
-                    let blocked = match scheduler.process_mut(pid) {
+                Some(pid) => match scheduler.keyboard_waiters.push(pid) {
+                    Ok(()) => match scheduler.process_mut(pid) {
                         Some(process) => {
                             process.state = ProcessState::Blocked;
-                            true
+                            Ok(())
                         }
-                        None => false,
-                    };
-                    if blocked {
-                        scheduler.keyboard_waiter = Some(pid);
-                        Ok(())
-                    } else {
-                        Err(SchedulerError::NoCurrentProcess)
-                    }
-                }
+                        None => {
+                            let _ = scheduler.keyboard_waiters.remove(pid);
+                            Err(SchedulerError::NoCurrentProcess)
+                        }
+                    },
+                    Err(QueueError::Full) => Err(SchedulerError::KeyboardQueueFull),
+                    Err(_) => Err(SchedulerError::NoCurrentProcess),
+                },
                 None => Err(SchedulerError::NoCurrentProcess),
             },
             None => Err(SchedulerError::NotInitialized),
@@ -274,18 +414,17 @@ pub fn wake_keyboard_waiter() {
     let Some(scheduler) = guard.as_mut() else {
         return;
     };
-    let Some(pid) = scheduler.keyboard_waiter.take() else {
-        return;
-    };
-    let woken = match scheduler.process_mut(pid) {
-        Some(process) if process.state == ProcessState::Blocked => {
-            process.state = ProcessState::Ready;
-            true
+    loop {
+        let Some(pid) = scheduler.keyboard_waiters.pop() else {
+            return;
+        };
+        if let Some(process) = scheduler.process_mut(pid) {
+            if process.state == ProcessState::Blocked {
+                process.state = ProcessState::Ready;
+                let _ = scheduler.ready.push_front(pid);
+                return;
+            }
         }
-        _ => false,
-    };
-    if woken {
-        let _ = scheduler.ready.push_front(pid);
     }
 }
 
@@ -296,11 +435,50 @@ pub fn exit_current(code: i32) -> ! {
         if let Some(scheduler) = guard.as_mut() {
             if let Some(pid) = scheduler.current {
                 let _ = scheduler.ready.remove(pid);
-                if let Some(process) = scheduler.process_mut(pid) {
-                    process.state = ProcessState::Terminated;
-                    process.exit_code = Some(code);
+                let _ = scheduler.keyboard_waiters.remove(pid);
+                let parent = match scheduler.process_mut(pid) {
+                    Some(process) => {
+                        process.state = ProcessState::Zombie;
+                        process.exit_code = Some(code);
+                        process.parent
+                    }
+                    None => None,
+                };
+                let mut parent_alive = false;
+                if let Some(parent_pid) = parent {
+                    if let Some(parent) = scheduler.process_mut(parent_pid) {
+                        if parent.state != ProcessState::Zombie {
+                            parent_alive = true;
+                            if parent.state == ProcessState::Blocked
+                                && parent
+                                    .waiting_for
+                                    .map(|target| target.matches(pid))
+                                    .unwrap_or(false)
+                            {
+                                parent.state = ProcessState::Ready;
+                                parent.waiting_for = None;
+                                let _ = scheduler.ready.push(parent_pid);
+                            }
+                        }
+                    }
                 }
-                let _ = scheduler.reap.push(pid);
+                let mut orphan_zombies = [None; MAX_PROCESSES];
+                let mut orphan_count = 0;
+                for process in scheduler.processes.iter_mut().flatten() {
+                    if process.parent == Some(pid) {
+                        process.parent = None;
+                        if process.state == ProcessState::Zombie && orphan_count < MAX_PROCESSES {
+                            orphan_zombies[orphan_count] = Some(process.pid);
+                            orphan_count += 1;
+                        }
+                    }
+                }
+                for orphan in orphan_zombies.iter().take(orphan_count).flatten() {
+                    let _ = scheduler.reap.push(*orphan);
+                }
+                if !parent_alive {
+                    let _ = scheduler.reap.push(pid);
+                }
             }
         }
     }

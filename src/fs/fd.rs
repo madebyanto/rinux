@@ -16,6 +16,7 @@ pub enum FdEntry {
     File(File),
 }
 
+#[derive(Clone)]
 pub struct FdTable {
     entries: [Option<FdEntry>; MAX_FDS],
 }

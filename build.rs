@@ -12,18 +12,12 @@ fn run(command: &mut Command) {
     }
 }
 
-fn main() {
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let source = manifest.join("user/hello.S");
-    let script = manifest.join("user/user.ld");
-    let object = out.join("hello.o");
-    let elf = out.join("hello.elf");
-    let binary = out.join("hello.bin");
-
+fn build_user(manifest: &PathBuf, out: &PathBuf, name: &str, script: &PathBuf) -> PathBuf {
+    let source = manifest.join(format!("user/{}.S", name));
+    let object = out.join(format!("{}.o", name));
+    let elf = out.join(format!("{}.elf", name));
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rerun-if-changed={}", script.display());
-    println!("cargo:rerun-if-changed=build.rs");
 
     let mut assembler = Command::new("as");
     assembler.arg("--64").arg("-o").arg(&object).arg(&source);
@@ -33,19 +27,33 @@ fn main() {
     linker
         .arg("-m")
         .arg("elf_x86_64")
+        .arg("-z")
+        .arg("max-page-size=4096")
         .arg("-T")
-        .arg(&script)
+        .arg(script)
         .arg("-o")
         .arg(&elf)
         .arg(&object);
     run(&mut linker);
 
-    let mut objcopy = Command::new("objcopy");
-    objcopy.arg("-O").arg("binary").arg(&elf).arg(&binary);
-    run(&mut objcopy);
-
-    let size = fs::metadata(&binary).expect("user blob metadata").len();
+    let size = fs::metadata(&elf).expect("user ELF metadata").len();
     if size == 0 || size > 64 * 1024 {
-        panic!("user blob size {} is outside 1..=65536", size);
+        panic!("user ELF {} size {} is outside 1..=65536", name, size);
     }
+    elf
+}
+
+fn main() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let script = manifest.join("user/user.ld");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", script.display());
+
+    let init = build_user(&manifest, &out, "init", &script);
+    let echo = build_user(&manifest, &out, "echo", &script);
+    let bin = manifest.join("build/user/bin");
+    fs::create_dir_all(&bin).expect("create build/user/bin");
+    fs::copy(init, bin.join("init.elf")).expect("copy init.elf");
+    fs::copy(echo, bin.join("echo.elf")).expect("copy echo.elf");
 }

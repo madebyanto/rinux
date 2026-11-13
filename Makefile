@@ -21,11 +21,13 @@ all: image
 build:
 	cargo build
 
-$(DISK_IMG):
-	mkdir -p $(DISK_ROOT)/sub $(BUILD_DIR)
+$(DISK_IMG): build
+	mkdir -p $(DISK_ROOT)/sub $(DISK_ROOT)/bin $(BUILD_DIR)
 	printf 'hello from ext2\n' > $(DISK_ROOT)/hello.txt
 	printf 'rinux ext2 demo\n' > $(DISK_ROOT)/readme.txt
 	printf 'nested file\n' > $(DISK_ROOT)/sub/nested.txt
+	cp $(BUILD_DIR)/user/bin/init.elf $(DISK_ROOT)/bin/init.elf
+	cp $(BUILD_DIR)/user/bin/echo.elf $(DISK_ROOT)/bin/echo.elf
 	truncate -s 32M $(DISK_IMG)
 	printf 'label: dos\nstart=$(DISK_START_LBA), size=$(DISK_SECTORS), type=83\n' | sfdisk $(DISK_IMG)
 	truncate -s 12M $(DISK_PART)

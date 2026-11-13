@@ -1,3 +1,5 @@
+#[path = "../../src/fs/elf.rs"]
+pub mod elf;
 #[path = "../../src/fs/ext2.rs"]
 pub mod ext2;
 #[path = "../../src/fs/fd.rs"]

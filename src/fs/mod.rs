@@ -1,3 +1,4 @@
+pub mod elf;
 pub mod ext2;
 pub mod fd;
 pub mod mbr;

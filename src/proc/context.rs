@@ -1,4 +1,5 @@
 use super::process::TaskEntry;
+use crate::arch::x86_64::syscall::SyscallFrame;
 use core::arch::global_asm;
 
 global_asm!(include_str!("../arch/x86_64/context.S"));
@@ -38,6 +39,7 @@ extern "C" {
     fn context_switch(old: *mut Context, new: *const Context);
     fn task_start();
     fn user_task_start();
+    fn fork_child_start();
 }
 
 pub unsafe fn switch(old: *mut Context, new: *const Context) {
@@ -56,6 +58,22 @@ pub fn prepare_stack(stack: &mut [u8], entry: TaskEntry) -> Context {
         rsp: prepare_slot(stack),
         rflags: INITIAL_RFLAGS,
         rbx: entry as usize as u64,
+        ..Context::default()
+    }
+}
+
+pub fn prepare_fork_stack(stack: &mut [u8], frame: &SyscallFrame) -> Context {
+    let top = (stack.as_mut_ptr() as usize + stack.len()) & !0xF;
+    let frame_ptr = (top - 256) as *mut SyscallFrame;
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame, frame_ptr, 1);
+        (*frame_ptr).rax = 0;
+    }
+    Context {
+        rsp: prepare_slot(stack),
+        rflags: INITIAL_RFLAGS,
+        rbx: fork_child_start as *const () as usize as u64,
+        r12: frame_ptr as u64,
         ..Context::default()
     }
 }

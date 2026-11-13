@@ -43,6 +43,8 @@ static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
 pub fn init(boot: &BootInfo) {
     paging::init_kernel_root();
+    paging::assert_no_nx_bits();
+    crate::arch::x86_64::cpu::enable_nxe();
     let kernel_start = addr_of!(__kernel_start) as usize;
     let kernel_end = addr_of!(__kernel_end) as usize;
     let (info_start, info_end) = boot.info_range();

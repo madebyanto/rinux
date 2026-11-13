@@ -2,23 +2,22 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0;
+    . = 0x0000008000000000;
 
-    .text : {
+    .text ALIGN(4K) : {
         *(.text .text.*)
     }
 
-    .rodata : {
+    .rodata ALIGN(4K) : {
         *(.rodata .rodata.*)
     }
 
-    .data : {
+    .data ALIGN(4K) : {
         *(.data .data.*)
     }
 
-    /DISCARD/ : {
-        *(.eh_frame*)
-        *(.comment)
-        *(.note*)
+    .bss ALIGN(4K) : {
+        *(.bss .bss.*)
+        *(COMMON)
     }
 }

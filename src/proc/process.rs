@@ -1,5 +1,7 @@
 use super::context::{self, Context, KERNEL_STACK_SIZE};
 use super::pid::Pid;
+use super::wait::WaitTarget;
+use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::fs::fd::FdTable;
 use crate::mm::address_space::AddressSpace;
 use alloc::vec::Vec;
@@ -12,7 +14,7 @@ pub enum ProcessState {
     Running,
     #[allow(dead_code)]
     Blocked,
-    Terminated,
+    Zombie,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +31,8 @@ pub struct Process {
     pub context: Context,
     pub address_space: AddressSpace,
     pub fds: FdTable,
+    pub parent: Option<Pid>,
+    pub waiting_for: Option<WaitTarget>,
     #[allow(dead_code)]
     pub exit_code: Option<i32>,
 }
@@ -56,6 +60,8 @@ impl Process {
             context,
             address_space,
             fds: FdTable::new(),
+            parent: None,
+            waiting_for: None,
             exit_code: None,
         })
     }
@@ -76,6 +82,31 @@ impl Process {
             context,
             address_space,
             fds: FdTable::new(),
+            parent: None,
+            waiting_for: None,
+            exit_code: None,
+        })
+    }
+
+    pub fn new_fork(
+        pid: Pid,
+        parent: Pid,
+        address_space: AddressSpace,
+        fds: FdTable,
+        frame: &SyscallFrame,
+    ) -> Result<Self, ProcessError> {
+        let (mut kernel_stack, kernel_stack_top) = Self::allocate_stack()?;
+        let context = context::prepare_fork_stack(&mut kernel_stack, frame);
+        Ok(Self {
+            pid,
+            state: ProcessState::Ready,
+            kernel_stack,
+            kernel_stack_top,
+            context,
+            address_space,
+            fds,
+            parent: Some(parent),
+            waiting_for: None,
             exit_code: None,
         })
     }

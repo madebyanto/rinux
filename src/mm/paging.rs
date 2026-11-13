@@ -1,12 +1,13 @@
 use super::frame::FRAME_SIZE;
 use super::{allocate_frame, deallocate_frame};
 use crate::arch::x86_64::cpu;
-use core::ptr::{read_volatile, write_bytes, write_volatile};
+use core::ptr::{copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
+pub const NO_EXECUTE: u64 = 1 << 63;
 pub const USER_PML4_INDEX: usize = 1;
 const HUGE_PAGE: u64 = 1 << 7;
 const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -175,6 +176,104 @@ pub(super) fn free_user_subtree(root: usize) {
     }
     let _ = deallocate_frame(p3);
     write_entry(entry_address(root, USER_PML4_INDEX), 0);
+}
+
+pub fn assert_no_nx_bits() {
+    let root = kernel_root();
+    assert!(root != 0);
+    for p4_index in 0..ENTRY_COUNT {
+        let p4_entry = read_entry(entry_address(root, p4_index));
+        if (p4_entry & PRESENT) == 0 {
+            continue;
+        }
+        assert!((p4_entry & NO_EXECUTE) == 0);
+        assert!((p4_entry & HUGE_PAGE) == 0);
+        let p3 = (p4_entry & ADDRESS_MASK) as usize;
+        for p3_index in 0..ENTRY_COUNT {
+            let p3_entry = read_entry(entry_address(p3, p3_index));
+            if (p3_entry & PRESENT) == 0 {
+                continue;
+            }
+            assert!((p3_entry & NO_EXECUTE) == 0);
+            if (p3_entry & HUGE_PAGE) != 0 {
+                continue;
+            }
+            let p2 = (p3_entry & ADDRESS_MASK) as usize;
+            for p2_index in 0..ENTRY_COUNT {
+                let p2_entry = read_entry(entry_address(p2, p2_index));
+                if (p2_entry & PRESENT) == 0 {
+                    continue;
+                }
+                assert!((p2_entry & NO_EXECUTE) == 0);
+                if (p2_entry & HUGE_PAGE) != 0 {
+                    continue;
+                }
+                let p1 = (p2_entry & ADDRESS_MASK) as usize;
+                for p1_index in 0..ENTRY_COUNT {
+                    let leaf = read_entry(entry_address(p1, p1_index));
+                    if (leaf & PRESENT) != 0 {
+                        assert!((leaf & NO_EXECUTE) == 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn clone_user_mappings(parent: usize, child: usize) -> Result<(), MapError> {
+    let p4_entry = read_entry(entry_address(parent, USER_PML4_INDEX));
+    if (p4_entry & PRESENT) == 0 {
+        return Ok(());
+    }
+    if (p4_entry & HUGE_PAGE) != 0 {
+        return Err(MapError::HugePageConflict);
+    }
+    let p3 = (p4_entry & ADDRESS_MASK) as usize;
+    for p3_index in 0..ENTRY_COUNT {
+        let p3_entry = read_entry(entry_address(p3, p3_index));
+        if (p3_entry & PRESENT) == 0 {
+            continue;
+        }
+        if (p3_entry & HUGE_PAGE) != 0 {
+            return Err(MapError::HugePageConflict);
+        }
+        let p2 = (p3_entry & ADDRESS_MASK) as usize;
+        for p2_index in 0..ENTRY_COUNT {
+            let p2_entry = read_entry(entry_address(p2, p2_index));
+            if (p2_entry & PRESENT) == 0 {
+                continue;
+            }
+            if (p2_entry & HUGE_PAGE) != 0 {
+                return Err(MapError::HugePageConflict);
+            }
+            let p1 = (p2_entry & ADDRESS_MASK) as usize;
+            for p1_index in 0..ENTRY_COUNT {
+                let leaf = read_entry(entry_address(p1, p1_index));
+                if (leaf & PRESENT) == 0 {
+                    continue;
+                }
+                let parent_phys = (leaf & ADDRESS_MASK) as usize;
+                let child_phys = allocate_frame().ok_or(MapError::OutOfFrames)?;
+                unsafe {
+                    copy_nonoverlapping(
+                        parent_phys as *const u8,
+                        child_phys as *mut u8,
+                        FRAME_SIZE,
+                    );
+                }
+                let virt = (USER_PML4_INDEX << 39)
+                    | (p3_index << 30)
+                    | (p2_index << 21)
+                    | (p1_index << 12);
+                let flags = (leaf & (WRITABLE | NO_EXECUTE)) | USER;
+                if let Err(error) = map_in(child, virt, child_phys, flags) {
+                    let _ = deallocate_frame(child_phys);
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn table_index(virt: usize, level: u32) -> usize {

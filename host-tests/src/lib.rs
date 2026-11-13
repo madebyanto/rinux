@@ -22,3 +22,7 @@ pub mod syscall_abi;
 pub mod descriptor;
 
 pub mod fs;
+#[path = "../../src/proc/wait.rs"]
+pub mod wait;
+#[path = "../../src/proc/wait_queue.rs"]
+pub mod wait_queue;

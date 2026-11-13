@@ -25,6 +25,14 @@ impl AddressSpace {
         self.root
     }
 
+    pub fn clone_user(&self) -> Result<Self, AddressSpaceError> {
+        let root = paging::create_kernel_root().map_err(|_| AddressSpaceError::OutOfMemory)?;
+        let child = Self { root };
+        paging::clone_user_mappings(self.root, child.root)
+            .map_err(|_| AddressSpaceError::MapFailed)?;
+        Ok(child)
+    }
+
     pub fn map_user(
         &mut self,
         virt: usize,

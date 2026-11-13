@@ -49,3 +49,27 @@ user_task_start:
     xor r14d, r14d
     xor r15d, r15d
     iretq
+
+.global fork_child_start
+fork_child_start:
+    mov rsp, r12
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    pop rcx
+    add rsp, 8
+    pop r11
+    mov rsp, qword ptr [rsp]
+    sysretq

@@ -68,6 +68,13 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
         fatal("ATA MBR sector read failed", error);
     }
     let mbr_found = mbr_sector[510] == 0x55 && mbr_sector[511] == 0xAA;
+    if !mbr_found {
+        fatal_display("ext2 mount failed", "no MBR signature 0x55AA");
+    }
+    let mount_info = match fs::mount(ata_info.sectors) {
+        Ok(info) => info,
+        Err(error) => fatal_display("ext2 mount failed", error),
+    };
     if let Err(error) = scheduler::init() {
         fatal("scheduler initialization failed", error);
     }
@@ -80,11 +87,13 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     if let Err(error) = scheduler::spawn(task_three) {
         fatal("task 3 spawn failed", error);
     }
-    let image = match user::init() {
+    let image = match user::exec::load("/bin/init.elf", &["/bin/init.elf"], &[]) {
         Ok(image) => image,
-        Err(error) => fatal("user image setup failed", error),
+        Err(error) => fatal_display("init ELF load failed", error),
     };
-    if let Err(error) = scheduler::spawn_user(image.entry, image.stack_top, image.address_space) {
+    let image_entry = image.entry;
+    let image_stack = image.stack_top;
+    if let Err(error) = scheduler::spawn_user(image_entry, image_stack, image.address_space) {
         fatal("user task spawn failed", error);
     }
     if let Err(error) = pic::unmask(0) {
@@ -116,11 +125,12 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
         "ata: MBR signature 0x55AA {}",
         if mbr_found { "found" } else { "not found" }
     );
-    if mbr_found {
-        mount_and_demo(ata_info.sectors);
-    } else {
-        fatal_display("ext2 mount failed", "no MBR signature 0x55AA");
-    }
+    print_ext2(&mount_info);
+    kprintln!(
+        "elf: loaded /bin/init.elf, entry {:#x}, stack {:#x}",
+        image_entry,
+        image_stack
+    );
     kprintln!(
         "gdt: kernel CS/SS {:#x}/{:#x}, user CS/SS {:#x}/{:#x}, TSS {:#x}",
         gdt::KERNEL_CODE,
@@ -134,12 +144,6 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
         arch::x86_64::syscall::lstar(),
         arch::x86_64::syscall::star_value(),
         arch::x86_64::syscall::fmask_value()
-    );
-    kprintln!(
-        "user: {} byte blob at {:#x}, stack top {:#x}",
-        user::blob_len(),
-        user::PROGRAM_BASE,
-        user::STACK_TOP
     );
     kprintln!(
         "scheduler: round-robin, {} tasks ({} ready), timeslice {} ms ({} ticks)",
@@ -193,11 +197,7 @@ fn task_body(id: u32) -> ! {
     }
 }
 
-fn mount_and_demo(disk_sectors: u32) {
-    let info = match fs::mount(disk_sectors) {
-        Ok(info) => info,
-        Err(error) => fatal_display("ext2 mount failed", error),
-    };
+fn print_ext2(info: &fs::MountInfo) {
     kprintln!(
         "ext2: partition start LBA {}, {} sectors",
         info.partition.start_lba,

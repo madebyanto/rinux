@@ -76,3 +76,38 @@ pub fn invlpg(address: usize) {
         asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     }
 }
+
+const IA32_EFER: u32 = 0xC000_0080;
+const EFER_NXE: u64 = 1 << 11;
+
+unsafe fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    asm!(
+        "rdmsr",
+        in("ecx") msr,
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack, preserves_flags)
+    );
+    ((high as u64) << 32) | low as u64
+}
+
+unsafe fn write_msr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    asm!(
+        "wrmsr",
+        in("ecx") msr,
+        in("eax") low,
+        in("edx") high,
+        options(nomem, nostack, preserves_flags)
+    );
+}
+
+pub fn enable_nxe() {
+    unsafe {
+        let efer = read_msr(IA32_EFER);
+        write_msr(IA32_EFER, efer | EFER_NXE);
+    }
+}
