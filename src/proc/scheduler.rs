@@ -187,6 +187,28 @@ pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
     })
 }
 
+/// Attempts to resolve a COW write fault for the running process.
+///
+/// Called from the page-fault entry path; the scheduler lock also protects the
+/// current address space from being torn down while the leaf is rewritten.
+pub fn resolve_cow_fault(virt_addr: usize) -> bool {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return false;
+        };
+        let Some(pid) = scheduler.current else {
+            return false;
+        };
+        match scheduler.process_mut(pid) {
+            Some(process) if process.address_space.root() == paging::active_root() => {
+                process.address_space.handle_cow_fault(virt_addr).is_ok()
+            }
+            _ => false,
+        }
+    })
+}
+
 pub fn task_count() -> usize {
     cpu::without_interrupts(|| {
         let guard = SCHEDULER.lock();

@@ -1,8 +1,12 @@
 pub mod address_space;
+pub mod fault;
 pub mod frame;
 pub mod heap;
 pub mod paging;
+pub mod pte;
+pub mod uaccess;
 
+use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::multiboot2::BootInfo;
 use crate::sync::SpinLock;
 use alloc::boxed::Box;
@@ -74,20 +78,34 @@ pub fn init(boot: &BootInfo) {
 }
 
 pub fn allocate_frame() -> Option<usize> {
-    FRAMES.lock().allocate()
+    cpu::without_interrupts(|| FRAMES.lock().allocate())
 }
 
-pub fn deallocate_frame(address: usize) -> Result<(), FrameError> {
-    FRAMES.lock().deallocate(address)
+pub fn retain_frame(address: usize) -> Result<u16, FrameError> {
+    cpu::without_interrupts(|| FRAMES.lock().retain(address))
+}
+
+pub fn release_frame(address: usize) -> Result<bool, FrameError> {
+    cpu::without_interrupts(|| FRAMES.lock().release(address))
+}
+
+pub fn frame_refcount(address: usize) -> Result<u16, FrameError> {
+    cpu::without_interrupts(|| FRAMES.lock().refcount(address))
 }
 
 pub fn self_test() {
     let first = allocate_frame().expect("frame allocation failed");
     let second = allocate_frame().expect("frame allocation failed");
     assert!(first != second && first % FRAME_SIZE == 0);
-    deallocate_frame(first).expect("frame release failed");
-    deallocate_frame(second).expect("frame release failed");
-    assert!(deallocate_frame(second) == Err(FrameError::NotAllocated));
+    assert_eq!(frame_refcount(first), Ok(1));
+    assert_eq!(retain_frame(first), Ok(2));
+    assert_eq!(frame_refcount(first), Ok(2));
+    assert_eq!(release_frame(first), Ok(false));
+    assert_eq!(frame_refcount(first), Ok(1));
+    assert_eq!(release_frame(first), Ok(true));
+    assert_eq!(release_frame(first), Err(FrameError::NotAllocated));
+    assert_eq!(release_frame(second), Ok(true));
+    assert_eq!(release_frame(second), Err(FrameError::NotAllocated));
 
     let boxed = Box::new(0x5249_4E55_5820_u64);
     assert!(*boxed == 0x5249_4E55_5820);
@@ -114,6 +132,6 @@ pub fn self_test() {
     assert!(paging::translate_page(SELF_TEST_PAGE) == Some(phys));
     assert!(paging::unmap(SELF_TEST_PAGE) == Ok(phys));
     assert!(paging::translate_page(SELF_TEST_PAGE).is_none());
-    deallocate_frame(phys).expect("frame release failed");
+    assert_eq!(release_frame(phys), Ok(true));
     kprintln!("paging self-test: ok");
 }

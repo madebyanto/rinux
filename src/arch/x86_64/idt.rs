@@ -1,5 +1,7 @@
 use super::cpu;
 use super::pic;
+use crate::mm::fault::PageFaultError;
+use crate::proc::scheduler;
 use crate::sync::SpinLock;
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -198,10 +200,31 @@ pub fn register_irq(irq: u8, handler: IrqHandler) -> Result<(), IrqError> {
 pub extern "C" fn interrupt_dispatch(frame: *mut TrapFrame) {
     let frame = unsafe { &mut *frame };
     match frame.vector {
-        0..=31 => handle_exception(frame),
+        0..=31 => {
+            if frame.vector == PAGE_FAULT && try_resolve_page_fault(frame) {
+                return;
+            }
+            handle_exception(frame)
+        }
         32..=47 => handle_irq((frame.vector - pic::VECTOR_BASE as u64) as u8),
         _ => handle_unexpected(frame),
     }
+}
+
+/// Handles a COW write fault before the fatal exception path runs.
+///
+/// Returning `true` leaves the trap frame untouched so `iretq` retries the
+/// faulting instruction. Kernel-origin faults are included because syscalls
+/// access user buffers directly under the user address space.
+fn try_resolve_page_fault(frame: &TrapFrame) -> bool {
+    if frame.vector != PAGE_FAULT {
+        return false;
+    }
+    let error = PageFaultError::new(frame.error_code);
+    if !error.is_cow_candidate() {
+        return false;
+    }
+    scheduler::resolve_cow_fault(cpu::read_cr2() as usize)
 }
 
 fn handle_exception(frame: &TrapFrame) -> ! {

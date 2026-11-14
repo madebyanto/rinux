@@ -1,3 +1,8 @@
+//! Fixed user virtual address layout and range validation.
+//!
+//! The user half currently uses a single PML4 slot: a 64 KiB program window
+//! and a 16 KiB stack below `0x0000_0080_0020_0000`.
+
 pub const PROGRAM_BASE: usize = 0x0000_0080_0000_0000;
 pub const PROGRAM_PAGES: usize = 16;
 pub const PROGRAM_SIZE: usize = PROGRAM_PAGES * 4096;

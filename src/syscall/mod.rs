@@ -5,13 +5,14 @@ use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::console;
 use crate::drivers::ps2;
 use crate::fs;
+use crate::fs::binfmt_elf;
+use crate::fs::binfmt_elf::LoadError;
 use crate::fs::elf::{self, ElfError};
 use crate::fs::fd::{FdEntry, FdError};
 use crate::fs::vfs::{FileType, VfsError};
+use crate::mm::uaccess;
 use crate::proc::scheduler::{self, ForkError, WaitResult};
 use crate::proc::wait::WaitTarget;
-use crate::user;
-use crate::user::exec::LoadError;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -64,7 +65,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
             if len == 0 {
                 return 0;
             }
-            if !user::stack_valid(buf as usize, 1) {
+            if !uaccess::stack_valid(buf as usize, 1) {
                 return abi::errno(abi::EFAULT);
             }
             loop {
@@ -90,7 +91,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
             if len > MAX_IO {
                 return abi::errno(abi::EINVAL);
             }
-            if !user::stack_valid(buf as usize, len) {
+            if !uaccess::stack_valid(buf as usize, len) {
                 return abi::errno(abi::EFAULT);
             }
             let buffer = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
@@ -124,7 +125,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
             if len > MAX_IO {
                 return abi::errno(abi::EINVAL);
             }
-            if !user::range_valid(buf as usize, len) {
+            if !uaccess::range_valid(buf as usize, len) {
                 return abi::errno(abi::EFAULT);
             }
             let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
@@ -172,7 +173,7 @@ fn sys_stat(path: u64, buffer: u64) -> u64 {
         Ok(stat) => stat,
         Err(error) => return vfs_errno(error),
     };
-    if !user::stack_valid(buffer as usize, size_of::<UserStat>()) {
+    if !uaccess::stack_valid(buffer as usize, size_of::<UserStat>()) {
         return abi::errno(abi::EFAULT);
     }
     let kind = match stat.kind {
@@ -236,7 +237,7 @@ fn sys_execve(frame: &mut SyscallFrame, path: u64, argv: u64, envp: u64) -> u64 
     };
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let envp_refs: Vec<&str> = envp.iter().map(String::as_str).collect();
-    let image = match user::exec::load(&path, &argv_refs, &envp_refs) {
+    let image = match binfmt_elf::load(&path, &argv_refs, &envp_refs) {
         Ok(image) => image,
         Err(error) => return load_errno(error),
     };
@@ -279,7 +280,7 @@ fn sys_waitpid(pid: u64, status: u64, options: u64) -> u64 {
     if options != 0 {
         return abi::errno(abi::EINVAL);
     }
-    if !user::range_valid(status as usize, 4) {
+    if !uaccess::range_valid(status as usize, 4) {
         return abi::errno(abi::EFAULT);
     }
     let target = match pid as i32 {
@@ -324,7 +325,7 @@ fn user_path(pointer: u64) -> Result<String, u64> {
         let address = (pointer as usize)
             .checked_add(offset)
             .ok_or_else(|| abi::errno(abi::EFAULT))?;
-        if !user::range_valid(address, 1) {
+        if !uaccess::range_valid(address, 1) {
             return Err(abi::errno(abi::EFAULT));
         }
         let byte = unsafe { core::ptr::read_volatile(address as *const u8) };
@@ -348,7 +349,7 @@ fn user_strings(pointer: u64) -> Result<Vec<String>, u64> {
         let address = (pointer as usize)
             .checked_add(index * 8)
             .ok_or_else(|| abi::errno(abi::EFAULT))?;
-        if !user::range_valid(address, 8) {
+        if !uaccess::range_valid(address, 8) {
             return Err(abi::errno(abi::EFAULT));
         }
         let string_pointer = unsafe { core::ptr::read_unaligned(address as *const u64) };
@@ -373,7 +374,7 @@ fn user_string(pointer: u64) -> Result<String, u64> {
         let address = (pointer as usize)
             .checked_add(offset)
             .ok_or_else(|| abi::errno(abi::EFAULT))?;
-        if !user::range_valid(address, 1) {
+        if !uaccess::range_valid(address, 1) {
             return Err(abi::errno(abi::EFAULT));
         }
         let byte = unsafe { core::ptr::read_volatile(address as *const u8) };

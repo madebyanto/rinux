@@ -1,16 +1,16 @@
-use super::frame::FRAME_SIZE;
-use super::{allocate_frame, deallocate_frame};
+use super::frame::{FrameError, FRAME_SIZE};
+use super::{allocate_frame, release_frame, retain_frame};
 use crate::arch::x86_64::cpu;
-use core::ptr::{copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
+use core::ptr::{read_volatile, write_bytes, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-pub const PRESENT: u64 = 1 << 0;
-pub const WRITABLE: u64 = 1 << 1;
-pub const USER: u64 = 1 << 2;
-pub const NO_EXECUTE: u64 = 1 << 63;
+#[allow(unused_imports)]
+pub use super::pte::{
+    child_mapping_flags, frame_address, is_cow, is_present, is_user, is_writable, make_cow,
+    make_writable, with_frame, ADDRESS_MASK, COW, COW_BIT, NO_EXECUTE, PRESENT, USER, WRITABLE,
+};
 pub const USER_PML4_INDEX: usize = 1;
 const HUGE_PAGE: u64 = 1 << 7;
-const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const ENTRY_COUNT: usize = 512;
 const ENTRY_SIZE: usize = 8;
 
@@ -24,6 +24,7 @@ pub enum MapError {
     HugePageConflict,
     OutOfFrames,
     NotInitialized,
+    Frame(FrameError),
 }
 
 pub fn init_kernel_root() {
@@ -105,7 +106,7 @@ pub fn translate_in(root: usize, virt: usize) -> Option<usize> {
     Some((entry & ADDRESS_MASK) as usize + virt % FRAME_SIZE)
 }
 
-fn leaf_slot_in(root: usize, virt: usize) -> Result<usize, MapError> {
+pub(super) fn leaf_slot_in(root: usize, virt: usize) -> Result<usize, MapError> {
     let mut table = root;
     for level in [4u32, 3, 2] {
         let entry = read_entry(entry_address(table, table_index(virt, level)));
@@ -167,14 +168,14 @@ pub(super) fn free_user_subtree(root: usize) {
             for p1_index in 0..ENTRY_COUNT {
                 let leaf = read_entry(entry_address(p1, p1_index));
                 if (leaf & PRESENT) != 0 {
-                    let _ = deallocate_frame((leaf & ADDRESS_MASK) as usize);
+                    let _ = release_frame((leaf & ADDRESS_MASK) as usize);
                 }
             }
-            let _ = deallocate_frame(p1);
+            let _ = release_frame(p1);
         }
-        let _ = deallocate_frame(p2);
+        let _ = release_frame(p2);
     }
-    let _ = deallocate_frame(p3);
+    let _ = release_frame(p3);
     write_entry(entry_address(root, USER_PML4_INDEX), 0);
 }
 
@@ -221,6 +222,7 @@ pub fn assert_no_nx_bits() {
 }
 
 pub fn clone_user_mappings(parent: usize, child: usize) -> Result<(), MapError> {
+    let parent_active = parent == active_root();
     let p4_entry = read_entry(entry_address(parent, USER_PML4_INDEX));
     if (p4_entry & PRESENT) == 0 {
         return Ok(());
@@ -252,23 +254,21 @@ pub fn clone_user_mappings(parent: usize, child: usize) -> Result<(), MapError> 
                 if (leaf & PRESENT) == 0 {
                     continue;
                 }
-                let parent_phys = (leaf & ADDRESS_MASK) as usize;
-                let child_phys = allocate_frame().ok_or(MapError::OutOfFrames)?;
-                unsafe {
-                    copy_nonoverlapping(
-                        parent_phys as *const u8,
-                        child_phys as *mut u8,
-                        FRAME_SIZE,
-                    );
-                }
                 let virt = (USER_PML4_INDEX << 39)
                     | (p3_index << 30)
                     | (p2_index << 21)
                     | (p1_index << 12);
-                let flags = (leaf & (WRITABLE | NO_EXECUTE)) | USER;
-                if let Err(error) = map_in(child, virt, child_phys, flags) {
-                    let _ = deallocate_frame(child_phys);
+                let parent_phys = frame_address(leaf);
+                retain_frame(parent_phys).map_err(MapError::Frame)?;
+                if let Err(error) = map_in(child, virt, parent_phys, child_mapping_flags(leaf)) {
+                    let _ = release_frame(parent_phys);
                     return Err(error);
+                }
+                if is_writable(leaf) {
+                    write_entry(entry_address(p1, p1_index), make_cow(leaf));
+                    if parent_active {
+                        cpu::invlpg(virt);
+                    }
                 }
             }
         }
@@ -290,10 +290,10 @@ fn new_table() -> Option<usize> {
     Some(frame)
 }
 
-fn read_entry(address: usize) -> u64 {
+pub(super) fn read_entry(address: usize) -> u64 {
     unsafe { read_volatile(address as *const u64) }
 }
 
-fn write_entry(address: usize, value: u64) {
+pub(super) fn write_entry(address: usize, value: u64) {
     unsafe { write_volatile(address as *mut u64, value) }
 }

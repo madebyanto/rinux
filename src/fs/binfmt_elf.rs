@@ -1,9 +1,17 @@
+//! ELF executable loader.
+//!
+//! This is the only binary format the kernel understands. It maps `PT_LOAD`
+//! segments at their fixed virtual addresses inside the user program window
+//! and builds the initial stack with `argv`/`envp`.
+
 use crate::fs::elf::{self, ElfError};
 use crate::fs::vfs::FileType;
 use crate::fs::vfs::VfsError;
 use crate::mm;
 use crate::mm::address_space::AddressSpace;
-use crate::user::range::{PROGRAM_BASE, PROGRAM_SIZE, STACK_PAGES, STACK_SIZE, STACK_TOP};
+use crate::mm::uaccess::{
+    PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, STACK_PAGES, STACK_SIZE, STACK_TOP,
+};
 use alloc::vec::Vec;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
@@ -47,13 +55,13 @@ impl core::fmt::Display for LoadError {
     }
 }
 
-pub struct UserImage {
+pub struct ExecImage {
     pub entry: u64,
     pub stack_top: u64,
     pub address_space: AddressSpace,
 }
 
-pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<UserImage, LoadError> {
+pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<ExecImage, LoadError> {
     let stat = crate::fs::stat_path(path)?;
     if stat.kind != FileType::Regular {
         return Err(LoadError::NotRegular);
@@ -122,7 +130,7 @@ pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<UserImage, LoadE
                 }
             }
             if address_space.map_user(page as usize, phys, flags).is_err() {
-                let _ = mm::deallocate_frame(phys);
+                let _ = mm::release_frame(phys);
                 return Err(LoadError::MapFailed);
             }
             page += PAGE_SIZE as u64;
@@ -134,7 +142,7 @@ pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<UserImage, LoadE
         .try_reserve_exact(STACK_PAGES)
         .map_err(|_| LoadError::OutOfMemory)?;
     for page in 0..STACK_PAGES {
-        let virt = crate::user::range::STACK_BASE + page * PAGE_SIZE;
+        let virt = STACK_BASE + page * PAGE_SIZE;
         let phys = mm::allocate_frame().ok_or(LoadError::OutOfMemory)?;
         unsafe { write_bytes(phys as *mut u8, 0, PAGE_SIZE) };
         if address_space
@@ -147,7 +155,7 @@ pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<UserImage, LoadE
             )
             .is_err()
         {
-            let _ = mm::deallocate_frame(phys);
+            let _ = mm::release_frame(phys);
             return Err(LoadError::MapFailed);
         }
         stack_frames.push(phys);
@@ -169,7 +177,7 @@ pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<UserImage, LoadE
         }
     }
 
-    Ok(UserImage {
+    Ok(ExecImage {
         entry: image.entry,
         stack_top: stack_pointer,
         address_space,

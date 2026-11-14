@@ -1,3 +1,4 @@
+pub mod binfmt_elf;
 pub mod elf;
 pub mod ext2;
 pub mod fd;

@@ -6,11 +6,11 @@ mod console;
 mod arch;
 mod drivers;
 mod fs;
+mod init;
 mod mm;
 mod proc;
 mod sync;
 mod syscall;
-mod user;
 
 extern crate alloc;
 
@@ -35,12 +35,44 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
         Ok(info) => info,
         Err(error) => panic!("multiboot2 parse failed: {:?}", error),
     };
+    let command_line = init::cmdline::init(boot_info.command_line());
+    let boot_params = init::cmdline::params();
+    if command_line.truncated {
+        kprintln!(
+            "cmdline: truncated to {} bytes",
+            command_line.stored_len
+        );
+    }
+    if command_line.unknown > 0 {
+        kprintln!(
+            "cmdline: {} unknown parameter(s) ignored",
+            command_line.unknown
+        );
+    }
+    if command_line.invalid > 0 {
+        kprintln!(
+            "cmdline: {} invalid parameter value(s) ignored",
+            command_line.invalid
+        );
+    }
+    kprintln!(
+        "cmdline: console={:?}, loglevel={}, selftest={}",
+        boot_params.console, boot_params.loglevel, boot_params.selftest
+    );
+    if let Some(root) = boot_params.root {
+        kprintln!("cmdline: root={}", root);
+    }
+    if let Some(init) = boot_params.init {
+        kprintln!("cmdline: init={}", init);
+    }
     kprintln!(
         "multiboot2: {} usable memory regions",
         boot_info.usable_regions().len()
     );
     mm::init(&boot_info);
-    mm::self_test();
+    if boot_params.selftest {
+        mm::self_test();
+    }
     kprintln!("memory subsystem ready");
 
     gdt::init();
@@ -87,7 +119,7 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     if let Err(error) = scheduler::spawn(task_three) {
         fatal("task 3 spawn failed", error);
     }
-    let image = match user::exec::load("/bin/init.elf", &["/bin/init.elf"], &[]) {
+    let image = match fs::binfmt_elf::load("/bin/init.elf", &["/bin/init.elf"], &[]) {
         Ok(image) => image,
         Err(error) => fatal_display("init ELF load failed", error),
     };

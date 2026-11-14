@@ -1,4 +1,4 @@
-use hosttest::user_range::{
+use hosttest::uaccess::{
     pml4_index, range_valid, stack_valid, PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, STACK_TOP,
     USER_PML4_INDEX,
 };

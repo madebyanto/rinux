@@ -1,52 +1,65 @@
 KERNEL_NAME := rinux
-TARGET_DIR := target/x86_64-rinux/debug
+PROFILE ?= debug
+TARGET_DIR := target/x86_64-rinux/$(PROFILE)
 KERNEL64 := $(TARGET_DIR)/$(KERNEL_NAME)
 BUILD_DIR := build
+KERNEL_ELF := $(BUILD_DIR)/rinux.elf
 ISO_ROOT := $(BUILD_DIR)/iso_root
 ISO := $(BUILD_DIR)/rinux.iso
-DISK_IMG := $(BUILD_DIR)/disk.img
-DISK_PART := $(BUILD_DIR)/disk-part.img
-DISK_ROOT := $(BUILD_DIR)/disk_root
-DISK_START_LBA := 2048
-DISK_SECTORS := 24576
+
+# The root filesystem is produced by the separate userspace repository.
+ROOTFS ?= $(BUILD_DIR)/rootfs.img
+
+# Kernel command line injected into grub.cfg.  Empty by default so the kernel
+# exercises the standard init fallback path.
+KERNEL_CMDLINE ?= root=/dev/hda1
+CMDLINE_ESCAPED := $(subst &,\&,$(KERNEL_CMDLINE))
+
 QEMU ?= qemu-system-x86_64
 QEMU_FLAGS := -boot order=d -cdrom $(ISO) \
-	-drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	-m 256M -serial stdio -no-reboot -no-shutdown
+QEMU_DISK := -drive file=$(ROOTFS),format=raw,if=ide,index=0,media=disk
 
-.PHONY: all build image run debug check clean
+ifeq ($(PROFILE),release)
+CARGO_FLAGS := --release
+else
+CARGO_FLAGS :=
+endif
+
+.PHONY: all build kernel image iso run debug check check-rootfs clean
 
 all: image
 
 build:
-	cargo build
+	cargo build $(CARGO_FLAGS)
 
-$(DISK_IMG): build
-	mkdir -p $(DISK_ROOT)/sub $(DISK_ROOT)/bin $(BUILD_DIR)
-	printf 'hello from ext2\n' > $(DISK_ROOT)/hello.txt
-	printf 'rinux ext2 demo\n' > $(DISK_ROOT)/readme.txt
-	printf 'nested file\n' > $(DISK_ROOT)/sub/nested.txt
-	cp $(BUILD_DIR)/user/bin/init.elf $(DISK_ROOT)/bin/init.elf
-	cp $(BUILD_DIR)/user/bin/echo.elf $(DISK_ROOT)/bin/echo.elf
-	truncate -s 32M $(DISK_IMG)
-	printf 'label: dos\nstart=$(DISK_START_LBA), size=$(DISK_SECTORS), type=83\n' | sfdisk $(DISK_IMG)
-	truncate -s 12M $(DISK_PART)
-	mke2fs -t ext2 -L rinux -F -d $(DISK_ROOT) $(DISK_PART)
-	dd if=$(DISK_PART) of=$(DISK_IMG) bs=512 seek=$(DISK_START_LBA) conv=notrunc status=none
-	rm -f $(DISK_PART)
+$(KERNEL_ELF): build
+	@mkdir -p $(BUILD_DIR)
+	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL64) $(KERNEL_ELF)
 
-image: build $(DISK_IMG)
+kernel: $(KERNEL_ELF)
+
+$(ISO): $(KERNEL_ELF)
 	rm -rf $(ISO_ROOT)
-	mkdir -p $(ISO_ROOT)/boot/grub $(BUILD_DIR)
-	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL64) $(ISO_ROOT)/boot/rinux.elf
-	cp grub/grub.cfg $(ISO_ROOT)/boot/grub/grub.cfg
+	mkdir -p $(ISO_ROOT)/boot/grub
+	cp $(KERNEL_ELF) $(ISO_ROOT)/boot/rinux.elf
+	sed 's|@KERNEL_CMDLINE@|$(CMDLINE_ESCAPED)|' \
+		grub/grub.cfg.in > $(ISO_ROOT)/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(ISO_ROOT)
 
-run: image
-	$(QEMU) $(QEMU_FLAGS)
+image: $(ISO)
 
-debug: image
-	$(QEMU) $(QEMU_FLAGS) -s -S
+check-rootfs:
+	@test -f "$(ROOTFS)" || { \
+		echo "*** ROOTFS is required: set ROOTFS=/path/to/rootfs.img" >&2; \
+		exit 1; \
+	}
+
+run: image check-rootfs
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_DISK)
+
+debug: image check-rootfs
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_DISK) -s -S
 
 check:
 	cargo check
@@ -54,4 +67,3 @@ check:
 clean:
 	cargo clean
 	rm -rf $(BUILD_DIR)
-	$(MAKE) -C host-tests clean

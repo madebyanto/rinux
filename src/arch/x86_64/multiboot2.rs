@@ -1,6 +1,7 @@
 use core::ptr::read_unaligned;
 
 const TAG_END: u32 = 0;
+const TAG_COMMAND_LINE: u32 = 1;
 const TAG_MEMORY_MAP: u32 = 6;
 const MEMORY_AVAILABLE: u32 = 1;
 const INFO_HEADER_SIZE: usize = 8;
@@ -29,6 +30,8 @@ pub struct BootInfo {
     info_end: usize,
     regions: [Region; MAX_REGIONS],
     region_count: usize,
+    command_line_start: usize,
+    command_line_len: usize,
 }
 
 impl BootInfo {
@@ -48,6 +51,8 @@ impl BootInfo {
             info_end: address + total,
             regions: [Region { start: 0, end: 0 }; MAX_REGIONS],
             region_count: 0,
+            command_line_start: 0,
+            command_line_len: 0,
         };
         let mut memory_map_found = false;
         let mut offset = INFO_HEADER_SIZE;
@@ -64,6 +69,8 @@ impl BootInfo {
             if tag_type == TAG_MEMORY_MAP {
                 info.parse_memory_map(tag, tag_size)?;
                 memory_map_found = true;
+            } else if tag_type == TAG_COMMAND_LINE {
+                info.parse_command_line(tag, tag_size);
             }
             offset += align8(tag_size);
         }
@@ -79,6 +86,43 @@ impl BootInfo {
 
     pub fn info_range(&self) -> (usize, usize) {
         (self.info_start, self.info_end)
+    }
+
+    /// Returns the NUL-terminated Multiboot2 command line, if one was supplied.
+    ///
+    /// The returned slice points into the boot information block. Callers that
+    /// need it past early boot must copy it first; `init::cmdline` does so.
+    pub fn command_line(&self) -> &[u8] {
+        if self.command_line_len == 0 {
+            return &[];
+        }
+        unsafe {
+            core::slice::from_raw_parts(
+                self.command_line_start as *const u8,
+                self.command_line_len,
+            )
+        }
+    }
+
+    unsafe fn parse_command_line(&mut self, tag: usize, size: usize) {
+        let capacity = size.saturating_sub(TAG_HEADER_SIZE);
+        if capacity == 0 {
+            return;
+        }
+        let start = tag + TAG_HEADER_SIZE;
+        let mut len = 0;
+        while len < capacity {
+            if read_u8(start + len) == 0 {
+                break;
+            }
+            len += 1;
+        }
+        if len == capacity {
+            // No terminator inside the tag: treat the tag as malformed.
+            return;
+        }
+        self.command_line_start = start;
+        self.command_line_len = len;
     }
 
     unsafe fn parse_memory_map(&mut self, tag: usize, size: usize) -> Result<(), BootInfoError> {
@@ -118,6 +162,10 @@ impl BootInfo {
 
 unsafe fn read_u32(address: usize) -> u32 {
     read_unaligned(address as *const u32)
+}
+
+unsafe fn read_u8(address: usize) -> u8 {
+    read_unaligned(address as *const u8)
 }
 
 unsafe fn read_u64(address: usize) -> u64 {
