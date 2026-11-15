@@ -6,5 +6,7 @@ pub mod ext2;
 pub mod fd;
 #[path = "../../src/fs/mbr.rs"]
 pub mod mbr;
+#[path = "../../src/fs/pipe.rs"]
+pub mod pipe;
 #[path = "../../src/fs/vfs.rs"]
 pub mod vfs;

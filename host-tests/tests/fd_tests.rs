@@ -36,7 +36,7 @@ fn updates_offsets_and_rejects_invalid_descriptors() {
         table.entry(fd),
         Ok(FdEntry::File(File { node: 7, offset: 42 }))
     );
-    assert_eq!(table.close(fd), Ok(()));
+    assert!(table.close(fd).is_ok());
     assert_eq!(table.entry(fd), Err(hosttest::fs::fd::FdError::InvalidFd));
 }
 

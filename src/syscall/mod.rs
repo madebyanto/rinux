@@ -9,9 +9,10 @@ use crate::fs::binfmt_elf;
 use crate::fs::binfmt_elf::LoadError;
 use crate::fs::elf;
 use crate::fs::fd::{FdEntry, FdError};
+use crate::fs::pipe::{self, PipeDirection};
 use crate::fs::vfs::{FileType, VfsError};
 use crate::mm::uaccess;
-use crate::proc::scheduler::{self, ForkError, WaitResult};
+use crate::proc::scheduler::{self, ForkError, SchedulerError, WaitResult};
 use crate::proc::wait::WaitTarget;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -46,6 +47,7 @@ pub extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         Some(abi::Syscall::Close) => sys_close(arg0),
         Some(abi::Syscall::Stat) => sys_stat(arg0, arg1),
         Some(abi::Syscall::Lseek) => sys_lseek(arg0, arg1, arg2),
+        Some(abi::Syscall::Pipe) => sys_pipe(arg0),
         Some(abi::Syscall::GetPid) => sys_getpid(),
         Some(abi::Syscall::Fork) => sys_fork(frame),
         Some(abi::Syscall::Execve) => sys_execve(frame, arg0, arg1, arg2),
@@ -108,6 +110,33 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
             }
             count as u64
         }
+        FdEntry::Pipe(end) => {
+            if len == 0 {
+                return 0;
+            }
+            let len = len as usize;
+            if len > MAX_IO {
+                return abi::errno(abi::EINVAL);
+            }
+            if !uaccess::range_valid(buf as usize, len) {
+                return abi::errno(abi::EFAULT);
+            }
+            let buffer = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+            loop {
+                match end.try_read(buffer) {
+                    pipe::ReadOutcome::Data(count) => return count as u64,
+                    pipe::ReadOutcome::EndOfFile => return 0,
+                    pipe::ReadOutcome::Empty => {
+                        if let Err(error) =
+                            scheduler::block_on_pipe(end.id(), PipeDirection::Read, || end.readable())
+                        {
+                            return scheduler_errno(error);
+                        }
+                    }
+                    pipe::ReadOutcome::WrongDirection => return abi::errno(abi::EBADF),
+                }
+            }
+        }
     }
 }
 
@@ -136,6 +165,35 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         }
         FdEntry::Keyboard => abi::errno(abi::EBADF),
         FdEntry::File(_) => abi::errno(abi::EROFS),
+        FdEntry::Pipe(end) => {
+            if len == 0 {
+                return 0;
+            }
+            let len = len as usize;
+            if len > MAX_IO {
+                return abi::errno(abi::EINVAL);
+            }
+            if !uaccess::range_valid(buf as usize, len) {
+                return abi::errno(abi::EFAULT);
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+            loop {
+                match end.try_write(bytes) {
+                    pipe::WriteOutcome::Written(count) => return count as u64,
+                    pipe::WriteOutcome::Full => {
+                        if let Err(error) = scheduler::block_on_pipe(
+                            end.id(),
+                            PipeDirection::Write,
+                            || end.writable(),
+                        ) {
+                            return scheduler_errno(error);
+                        }
+                    }
+                    pipe::WriteOutcome::BrokenPipe => return abi::errno(abi::EPIPE),
+                    pipe::WriteOutcome::WrongDirection => return abi::errno(abi::EBADF),
+                }
+            }
+        }
     }
 }
 
@@ -208,6 +266,28 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     }
 }
 
+fn sys_pipe(fds: u64) -> u64 {
+    if !uaccess::range_valid(fds as usize, size_of::<[i32; 2]>()) {
+        return abi::errno(abi::EFAULT);
+    }
+    let id = match scheduler::allocate_pipe() {
+        Ok(id) => id,
+        Err(error) => return scheduler_errno(error),
+    };
+    let (read_end, write_end) = match pipe::create(id) {
+        Ok(ends) => ends,
+        Err(_) => return abi::errno(abi::ENOMEM),
+    };
+    let (read_fd, write_fd) = match scheduler::current_install_pipe(&read_end, &write_end) {
+        Ok(pair) => pair,
+        Err(error) => return fd_errno(error),
+    };
+    unsafe {
+        core::ptr::write_unaligned(fds as *mut [i32; 2], [read_fd as i32, write_fd as i32]);
+    }
+    0
+}
+
 fn sys_fork(frame: &SyscallFrame) -> u64 {
     match scheduler::fork_current(frame) {
         Ok(pid) => {
@@ -277,9 +357,10 @@ fn sys_execve(frame: &mut SyscallFrame, path: u64, argv: u64, envp: u64) -> u64 
 }
 
 fn sys_waitpid(pid: u64, status: u64, options: u64) -> u64 {
-    if options != 0 {
+    if options & !abi::WNOHANG != 0 {
         return abi::errno(abi::EINVAL);
     }
+    let no_hang = options & abi::WNOHANG != 0;
     if !uaccess::range_valid(status as usize, 4) {
         return abi::errno(abi::EFAULT);
     }
@@ -300,8 +381,11 @@ fn sys_waitpid(pid: u64, status: u64, options: u64) -> u64 {
             }
             WaitResult::NoChild => return abi::errno(abi::ECHILD),
             WaitResult::Block => {
-                if scheduler::block_on_child(target).is_err() {
-                    return abi::errno(abi::EIO);
+                if no_hang {
+                    return 0;
+                }
+                if let Err(error) = scheduler::block_on_child(target) {
+                    return scheduler_errno(error);
                 }
             }
         }
@@ -405,6 +489,18 @@ fn fork_errno(error: ForkError) -> u64 {
             abi::errno(abi::EAGAIN)
         }
         ForkError::OutOfMemory => abi::errno(abi::ENOMEM),
+    }
+}
+
+fn scheduler_errno(error: SchedulerError) -> u64 {
+    match error {
+        SchedulerError::NotInitialized | SchedulerError::NoCurrentProcess => {
+            abi::errno(abi::ESRCH)
+        }
+        SchedulerError::KeyboardQueueFull => abi::errno(abi::EAGAIN),
+        SchedulerError::PipeTableFull => abi::errno(abi::ENFILE),
+        SchedulerError::InvalidPipe => abi::errno(abi::EBADF),
+        SchedulerError::AlreadyInitialized => abi::errno(abi::EIO),
     }
 }
 

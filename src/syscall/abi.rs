@@ -4,6 +4,7 @@ pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_LSEEK: u64 = 8;
+pub const SYS_PIPE: u64 = 22;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_EXECVE: u64 = 59;
 pub const SYS_GETPID: u64 = 39;
@@ -24,10 +25,15 @@ pub const EFAULT: i64 = 14;
 pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
+pub const ENFILE: i64 = 23;
 pub const EMFILE: i64 = 24;
+pub const EPIPE: i64 = 32;
 pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
+
+/// `waitpid` option: return immediately when no child has exited.
+pub const WNOHANG: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Syscall {
@@ -37,6 +43,7 @@ pub enum Syscall {
     Close,
     Stat,
     Lseek,
+    Pipe,
     GetPid,
     Fork,
     Execve,
@@ -52,6 +59,7 @@ pub fn classify(number: u64) -> Option<Syscall> {
         SYS_CLOSE => Some(Syscall::Close),
         SYS_STAT => Some(Syscall::Stat),
         SYS_LSEEK => Some(Syscall::Lseek),
+        SYS_PIPE => Some(Syscall::Pipe),
         SYS_GETPID => Some(Syscall::GetPid),
         SYS_FORK => Some(Syscall::Fork),
         SYS_EXECVE => Some(Syscall::Execve),

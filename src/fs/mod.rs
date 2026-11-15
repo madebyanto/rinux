@@ -3,6 +3,7 @@ pub mod elf;
 pub mod ext2;
 pub mod fd;
 pub mod mbr;
+pub mod pipe;
 pub mod vfs;
 
 use crate::drivers::ata;

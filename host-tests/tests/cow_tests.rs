@@ -142,7 +142,57 @@ fn frame_byte(address: usize, offset: usize) -> u8 {
 }
 
 #[test]
+fn nested_forks_copy_the_page_once_per_writer() {
+    let _serial = hosttest::lock_page_table_tests();
+    hosttest::init_frames();
+    hosttest::paging::init_kernel_root();
+
+    let mut parent = AddressSpace::new().expect("parent address space");
+    let shared = hosttest::allocate_frame().expect("shared frame");
+    fill_frame(shared, 0x3C);
+    parent
+        .map_user(USER_VIRT, shared, USER | WRITABLE | NO_EXECUTE)
+        .expect("map shared");
+
+    let child = parent.clone_user().expect("child clone");
+    let mut grandchild = child.clone_user().expect("grandchild clone");
+    assert_eq!(hosttest::frame_refcount(shared), Ok(3));
+
+    grandchild
+        .handle_cow_fault(USER_VIRT)
+        .expect("grandchild COW fault");
+    let grandchild_page =
+        hosttest::paging::translate_in(grandchild.root(), USER_VIRT).expect("grandchild page");
+    assert_ne!(grandchild_page, shared);
+    assert_eq!(hosttest::frame_refcount(shared), Ok(2));
+    assert_eq!(hosttest::frame_refcount(grandchild_page), Ok(1));
+
+    parent
+        .handle_cow_fault(USER_VIRT)
+        .expect("parent COW fault");
+    let parent_page =
+        hosttest::paging::translate_in(parent.root(), USER_VIRT).expect("parent page");
+    assert_ne!(parent_page, shared);
+    assert_ne!(parent_page, grandchild_page);
+    assert_eq!(hosttest::frame_refcount(shared), Ok(1));
+
+    assert_eq!(frame_byte(parent_page, 0), 0x3C);
+    assert_eq!(frame_byte(grandchild_page, FRAME_SIZE - 1), 0x3C);
+    assert_eq!(
+        hosttest::paging::translate_in(child.root(), USER_VIRT),
+        Some(shared)
+    );
+
+    drop(child);
+    assert_eq!(
+        hosttest::frame_refcount(shared),
+        Err(FrameError::NotAllocated)
+    );
+}
+
+#[test]
 fn resolves_cow_faults_in_place_and_by_copying() {
+    let _serial = hosttest::lock_page_table_tests();
     hosttest::init_frames();
     hosttest::paging::init_kernel_root();
 

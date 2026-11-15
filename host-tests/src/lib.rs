@@ -73,6 +73,19 @@ struct HostFrames {
 }
 
 static HOST_FRAMES: Mutex<Option<HostFrames>> = Mutex::new(None);
+
+/// Serializes tests that build and switch page tables.
+///
+/// The host `cpu::write_cr3` shim keeps a single process-wide "active root", so
+/// two tests mapping user pages concurrently would otherwise activate each
+/// other's tables.
+static PAGE_TABLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn lock_page_table_tests() -> std::sync::MutexGuard<'static, ()> {
+    PAGE_TABLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 static HOST_FRAME_BASE: AtomicUsize = AtomicUsize::new(0);
 static HOST_FRAMES_INIT: Once = Once::new();
 

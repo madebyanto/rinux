@@ -8,13 +8,18 @@ use super::wait_queue::{PidQueue, QueueError};
 use crate::arch::x86_64::cpu;
 use crate::arch::x86_64::gdt;
 use crate::arch::x86_64::syscall::SyscallFrame;
-use crate::fs::fd::{FdEntry, FdError};
+use crate::fs::fd::{FdEntry, FdError, FdTable};
+use crate::fs::pipe::PipeDirection;
 use crate::mm::address_space::AddressSpace;
 use crate::mm::paging;
 use crate::sync::SpinLock;
+use alloc::sync::Arc;
 
 pub const TIMESLICE_TICKS: u32 = 10;
 pub const TIMESLICE_MS: u64 = 100;
+
+/// Fixed number of pipes that can have tasks blocked on them at once.
+pub const MAX_PIPES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerError {
@@ -22,6 +27,8 @@ pub enum SchedulerError {
     NotInitialized,
     NoCurrentProcess,
     KeyboardQueueFull,
+    PipeTableFull,
+    InvalidPipe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +57,27 @@ pub enum WaitResult {
     NoChild,
 }
 
+/// Wait queues for one pipe id.
+///
+/// Queues live in the scheduler so that registering a waiter and marking the
+/// task blocked happen under a single lock. A pipe reserves an id for its whole
+/// lifetime and releases it when the last endpoint is dropped.
+struct PipeWaiters {
+    used: bool,
+    readers: PidQueue,
+    writers: PidQueue,
+}
+
+impl PipeWaiters {
+    const fn new() -> Self {
+        Self {
+            used: false,
+            readers: PidQueue::new(),
+            writers: PidQueue::new(),
+        }
+    }
+}
+
 struct Scheduler {
     processes: [Option<Process>; MAX_PROCESSES],
     ready: ReadyQueue,
@@ -59,6 +87,7 @@ struct Scheduler {
     pids: PidAllocator,
     reap: ReapList,
     keyboard_waiters: PidQueue,
+    pipe_waiters: [PipeWaiters; MAX_PIPES],
     ticks_remaining: u32,
     timeslice_ticks: u32,
 }
@@ -76,6 +105,7 @@ impl Scheduler {
             pids: PidAllocator::new(),
             reap: ReapList::new(),
             keyboard_waiters: PidQueue::new(),
+            pipe_waiters: core::array::from_fn(|_| PipeWaiters::new()),
             ticks_remaining: timeslice_ticks,
             timeslice_ticks,
         }
@@ -87,17 +117,166 @@ impl Scheduler {
             .flatten()
             .find(|process| process.pid == pid)
     }
+
+    fn allocate_pipe_id(&mut self) -> Option<usize> {
+        for (id, slot) in self.pipe_waiters.iter_mut().enumerate() {
+            if !slot.used {
+                *slot = PipeWaiters::new();
+                slot.used = true;
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn release_pipe_id(&mut self, id: usize) {
+        if let Some(slot) = self.pipe_waiters.get_mut(id) {
+            *slot = PipeWaiters::new();
+        }
+    }
+
+    fn register_pipe_waiter(&mut self, id: usize, direction: PipeDirection, pid: Pid) -> bool {
+        let Some(slot) = self.pipe_waiters.get_mut(id) else {
+            return false;
+        };
+        let queue = match direction {
+            PipeDirection::Read => &mut slot.readers,
+            PipeDirection::Write => &mut slot.writers,
+        };
+        queue.push(pid).is_ok()
+    }
+
+    fn has_zombie_child(&self, parent: Pid, target: WaitTarget) -> bool {
+        self.processes.iter().flatten().any(|process| {
+            process.parent == Some(parent)
+                && target.matches(process.pid)
+                && process.state == ProcessState::Zombie
+        })
+    }
 }
 
 pub fn init() -> Result<(), SchedulerError> {
-    cpu::without_interrupts(|| {
+    let result = cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         if guard.is_some() {
             return Err(SchedulerError::AlreadyInitialized);
         }
         *guard = Some(Scheduler::new(TIMESLICE_TICKS));
         Ok(())
+    });
+    if result.is_ok() {
+        crate::fs::pipe::set_hooks(pipe_wake_hook, pipe_release_hook);
+    }
+    result
+}
+
+fn pipe_wake_hook(id: usize, direction: PipeDirection) {
+    wake_pipe(id, direction);
+}
+
+fn pipe_release_hook(id: usize) {
+    release_pipe(id);
+}
+
+/// Reserves a pipe id for `fs::pipe::create`.
+pub fn allocate_pipe() -> Result<usize, SchedulerError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SchedulerError::NotInitialized)?;
+        scheduler
+            .allocate_pipe_id()
+            .ok_or(SchedulerError::PipeTableFull)
     })
+}
+
+/// Releases a pipe id once its last endpoint has been dropped.
+pub fn release_pipe(id: usize) {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        if let Some(scheduler) = guard.as_mut() {
+            scheduler.release_pipe_id(id);
+        }
+    });
+}
+
+/// Blocks the current task until `ready` observes that the pipe made progress.
+///
+/// The predicate runs under the scheduler lock while interrupts are disabled,
+/// so a wakeup racing with registration is impossible: the writer either runs
+/// after registration (and finds the waiter) or before it (and the predicate
+/// already observes the new data). The pipe lock is only taken inside
+/// `ready`, giving the lock order scheduler -> pipe.
+pub fn block_on_pipe<F>(
+    id: usize,
+    direction: PipeDirection,
+    ready: F,
+) -> Result<(), SchedulerError>
+where
+    F: FnOnce() -> bool,
+{
+    let flags = cpu::read_rflags();
+    cpu::disable_interrupts();
+    let wait = {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            cpu::restore_rflags(flags);
+            return Err(SchedulerError::NotInitialized);
+        };
+        let Some(pid) = scheduler.current else {
+            cpu::restore_rflags(flags);
+            return Err(SchedulerError::NoCurrentProcess);
+        };
+        if ready() {
+            false
+        } else {
+            if !scheduler.register_pipe_waiter(id, direction, pid) {
+                cpu::restore_rflags(flags);
+                return Err(SchedulerError::InvalidPipe);
+            }
+            if let Some(process) = scheduler.process_mut(pid) {
+                process.state = ProcessState::Blocked;
+            }
+            true
+        }
+    };
+    if wait {
+        schedule();
+    }
+    cpu::restore_rflags(flags);
+    Ok(())
+}
+
+/// Readies every task blocked on one side of a pipe.
+pub fn wake_pipe(id: usize, direction: PipeDirection) {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return;
+        };
+        let Some(slot) = scheduler.pipe_waiters.get_mut(id) else {
+            return;
+        };
+        let queue = match direction {
+            PipeDirection::Read => &mut slot.readers,
+            PipeDirection::Write => &mut slot.writers,
+        };
+        let mut woken = [None; MAX_PROCESSES];
+        let mut count = 0;
+        while let Some(pid) = queue.pop() {
+            if count < MAX_PROCESSES {
+                woken[count] = Some(pid);
+                count += 1;
+            }
+        }
+        for pid in woken.iter().take(count).flatten() {
+            if let Some(process) = scheduler.process_mut(*pid) {
+                if process.state == ProcessState::Blocked {
+                    process.state = ProcessState::Ready;
+                    let _ = scheduler.ready.push(*pid);
+                }
+            }
+        }
+    });
 }
 
 pub fn spawn(entry: TaskEntry) -> Result<Pid, SpawnError> {
@@ -133,7 +312,8 @@ pub fn spawn_init(entry: TaskEntry) -> Result<Pid, SpawnError> {
 }
 
 pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
-    cpu::without_interrupts(|| {
+    let mut discarded: Option<Process> = None;
+    let result = cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         let scheduler = guard.as_mut().ok_or(ForkError::NoCurrent)?;
         let parent_pid = scheduler.current.ok_or(ForkError::NoCurrent)?;
@@ -162,11 +342,15 @@ pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
             .map_err(|_| ForkError::OutOfMemory)?;
         scheduler.processes[slot] = Some(process);
         if scheduler.ready.push(pid).is_err() {
-            scheduler.processes[slot] = None;
+            // The child inherited pipe endpoints; detach and drop it outside
+            // the scheduler lock.
+            discarded = scheduler.processes[slot].take();
             return Err(ForkError::QueueFull);
         }
         Ok(pid)
-    })
+    });
+    drop(discarded);
+    result
 }
 
 /// Attempts to resolve a COW write fault for the running process.
@@ -265,13 +449,52 @@ pub fn current_open_fd(node: u32) -> Result<u32, FdError> {
 }
 
 pub fn current_close_fd(fd: u32) -> Result<(), FdError> {
-    cpu::without_interrupts(|| {
+    let removed = cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         let scheduler = guard.as_mut().ok_or(FdError::NoProcess)?;
         let pid = scheduler.current.ok_or(FdError::NoProcess)?;
         let process = scheduler.process_mut(pid).ok_or(FdError::NoProcess)?;
         process.fds.close(fd)
-    })
+    })?;
+    // Dropping a pipe endpoint may wake blocked peers, which takes the
+    // scheduler lock again. Never run that destructor under the lock.
+    drop(removed);
+    Ok(())
+}
+
+/// Installs both ends of a new pipe and returns their descriptors.
+///
+/// Nothing can be installed under the scheduler lock: if the second descriptor
+/// is unavailable the first one is detached and dropped after unlocking, since
+/// a pipe endpoint destructor calls back into the scheduler to wake peers.
+pub fn current_install_pipe(
+    read: &Arc<crate::fs::pipe::PipeEnd>,
+    write: &Arc<crate::fs::pipe::PipeEnd>,
+) -> Result<(u32, u32), FdError> {
+    let mut rollback: Option<FdEntry> = None;
+    let result = cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(FdError::NoProcess)?;
+        let pid = scheduler.current.ok_or(FdError::NoProcess)?;
+        let process = scheduler.process_mut(pid).ok_or(FdError::NoProcess)?;
+        if process.fds.free_count() < 2 {
+            return Err(FdError::NoFreeFd);
+        }
+        let read_fd = process
+            .fds
+            .install(FdEntry::Pipe(read.clone()))
+            .map_err(|_| FdError::NoFreeFd)?;
+        let write_fd = match process.fds.install(FdEntry::Pipe(write.clone())) {
+            Ok(fd) => fd,
+            Err(_) => {
+                rollback = process.fds.take(read_fd).ok();
+                return Err(FdError::NoFreeFd);
+            }
+        };
+        Ok((read_fd, write_fd))
+    });
+    drop(rollback);
+    result
 }
 
 pub fn current_set_fd_offset(fd: u32, offset: u64) -> Result<(), FdError> {
@@ -297,15 +520,15 @@ pub fn replace_address_space(new: AddressSpace) -> Result<AddressSpace, Schedule
 }
 
 pub fn try_wait(target: WaitTarget) -> WaitResult {
-    cpu::without_interrupts(|| {
+    let (result, reaped) = cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         let scheduler = match guard.as_mut() {
             Some(scheduler) => scheduler,
-            None => return WaitResult::NoChild,
+            None => return (WaitResult::NoChild, None),
         };
         let parent = match scheduler.current {
             Some(parent) => parent,
-            None => return WaitResult::NoChild,
+            None => return (WaitResult::NoChild, None),
         };
         let mut matched = false;
         let mut reap = None;
@@ -323,45 +546,53 @@ pub fn try_wait(target: WaitTarget) -> WaitResult {
             }
         }
         if let Some(index) = reap {
-            let pid = scheduler.processes[index]
-                .as_ref()
-                .map(|process| process.pid)
-                .unwrap_or(0);
-            let code = scheduler.processes[index]
+            let process = scheduler.processes[index].take();
+            let pid = process.as_ref().map(|process| process.pid).unwrap_or(0);
+            let code = process
                 .as_ref()
                 .and_then(|process| process.exit_code)
                 .unwrap_or(0);
-            let _ = scheduler.processes[index].take();
-            WaitResult::Reaped(pid, code)
+            (WaitResult::Reaped(pid, code), process)
         } else if matched {
-            WaitResult::Block
+            (WaitResult::Block, None)
         } else {
-            WaitResult::NoChild
+            (WaitResult::NoChild, None)
         }
-    })
+    });
+    // The zombie may own pipe descriptors; drop it outside the scheduler lock.
+    drop(reaped);
+    result
 }
 
 pub fn block_on_child(target: WaitTarget) -> Result<(), SchedulerError> {
     let flags = cpu::read_rflags();
     cpu::disable_interrupts();
-    let result = {
+    let (result, wait) = {
         let mut guard = SCHEDULER.lock();
         match guard.as_mut() {
             Some(scheduler) => match scheduler.current {
-                Some(pid) => match scheduler.process_mut(pid) {
-                    Some(process) => {
-                        process.state = ProcessState::Blocked;
-                        process.waiting_for = Some(target);
-                        Ok(())
+                Some(pid) => {
+                    // A child may have exited after `try_wait` decided to block.
+                    // Recheck while registering so the wakeup cannot be lost.
+                    if scheduler.has_zombie_child(pid, target) {
+                        (Ok(()), false)
+                    } else {
+                        match scheduler.process_mut(pid) {
+                            Some(process) => {
+                                process.state = ProcessState::Blocked;
+                                process.waiting_for = Some(target);
+                                (Ok(()), true)
+                            }
+                            None => (Err(SchedulerError::NoCurrentProcess), false),
+                        }
                     }
-                    None => Err(SchedulerError::NoCurrentProcess),
-                },
-                None => Err(SchedulerError::NoCurrentProcess),
+                }
+                None => (Err(SchedulerError::NoCurrentProcess), false),
             },
-            None => Err(SchedulerError::NotInitialized),
+            None => (Err(SchedulerError::NotInitialized), false),
         }
     };
-    if result.is_ok() {
+    if wait {
         schedule();
     }
     cpu::restore_rflags(flags);
@@ -450,6 +681,12 @@ pub fn wake_keyboard_waiter() {
 
 pub fn exit_current(code: i32) -> ! {
     cpu::disable_interrupts();
+    // Descriptors are closed as part of exiting, not when the zombie is
+    // reaped: a blocked reader must observe end-of-file as soon as the last
+    // writer is gone, even if the parent has not called `waitpid` yet.
+    // Detach the table here and drop it below, outside the scheduler lock,
+    // because a pipe endpoint destructor wakes peers through that same lock.
+    let mut orphaned_fds: Option<FdTable> = None;
     {
         let mut guard = SCHEDULER.lock();
         if let Some(scheduler) = guard.as_mut() {
@@ -459,10 +696,18 @@ pub fn exit_current(code: i32) -> ! {
                 }
                 let _ = scheduler.ready.remove(pid);
                 let _ = scheduler.keyboard_waiters.remove(pid);
+                for waiters in scheduler.pipe_waiters.iter_mut() {
+                    let _ = waiters.readers.remove(pid);
+                    let _ = waiters.writers.remove(pid);
+                }
                 let parent = match scheduler.process_mut(pid) {
                     Some(process) => {
                         process.state = ProcessState::Zombie;
                         process.exit_code = Some(code);
+                        orphaned_fds = Some(core::mem::replace(
+                            &mut process.fds,
+                            FdTable::empty(),
+                        ));
                         process.parent
                     }
                     None => None,
@@ -498,12 +743,45 @@ pub fn exit_current(code: i32) -> ! {
             }
         }
     }
+    // Pipe endpoints (and any other owned descriptors) are released here,
+    // where waking blocked peers cannot re-enter a held scheduler lock.
+    drop(orphaned_fds);
     crate::kprintln!("process exited with code {}", code);
     schedule();
     cpu::halt_forever()
 }
 
+/// Detaches reaped processes and drops them without holding the scheduler lock.
+///
+/// Dropping a process frees its address space and closes its descriptor table;
+/// a pipe endpoint destructor may in turn call back into the scheduler to wake
+/// peers, so it must never run under `SCHEDULER`.
+fn reap_processes() {
+    loop {
+        let pid = cpu::without_interrupts(|| {
+            let mut guard = SCHEDULER.lock();
+            guard
+                .as_mut()
+                .and_then(|scheduler| scheduler.reap.take_reapable(scheduler.current))
+        });
+        let Some(pid) = pid else {
+            break;
+        };
+        let process = cpu::without_interrupts(|| {
+            let mut guard = SCHEDULER.lock();
+            let scheduler = guard.as_mut()?;
+            let slot = scheduler
+                .processes
+                .iter()
+                .position(|process| process.as_ref().map_or(false, |process| process.pid == pid))?;
+            scheduler.processes[slot].take()
+        });
+        drop(process);
+    }
+}
+
 fn schedule() {
+    reap_processes();
     let (old_context, new_context, next_top, next_root) = {
         let mut guard = SCHEDULER.lock();
         let Some(scheduler) = guard.as_mut() else {
@@ -511,15 +789,6 @@ fn schedule() {
         };
 
         let current = scheduler.current;
-        while let Some(pid) = scheduler.reap.take_reapable(current) {
-            let slot = scheduler
-                .processes
-                .iter()
-                .position(|process| process.as_ref().map_or(false, |process| process.pid == pid));
-            if let Some(slot) = slot {
-                let _ = scheduler.processes[slot].take();
-            }
-        }
 
         if let Some(pid) = current {
             let requeue = match scheduler.process_mut(pid) {

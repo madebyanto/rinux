@@ -50,33 +50,51 @@ pub fn enter_user(entry: u64, stack_top: u64) -> ! {
     unsafe { enter_user_mode(entry, stack_top) }
 }
 
-fn prepare_slot(stack: &mut [u8]) -> u64 {
+/// Distance between the top of a kernel stack and the saved syscall frame.
+///
+/// Interrupts enter ring 0 with `TSS.rsp0` pointing at the same top and build a
+/// trap frame of roughly 176 bytes there, so the copy must stay below that
+/// window. `fork_child_start` also runs with interrupts disabled until
+/// `sysretq`, which keeps the copy intact while it is being consumed.
+const FORK_FRAME_OFFSET: usize = 256;
+
+/// Builds the `ret` target slot for a fresh kernel stack.
+///
+/// `context_switch` ends with `ret`, so the stack top holds the address the
+/// task starts at. `entry` must not return: both `task_start` and
+/// `fork_child_start` finish by leaving the kernel for good.
+fn prepare_slot(stack: &mut [u8], entry: usize) -> u64 {
     let top = (stack.as_mut_ptr() as usize + stack.len()) & !0xF;
     let return_slot = (top - core::mem::size_of::<u64>()) as *mut u64;
-    unsafe { return_slot.write(task_start as *const () as usize as u64) };
+    unsafe { return_slot.write(entry as u64) };
     return_slot as u64
 }
 
 pub fn prepare_stack(stack: &mut [u8], entry: TaskEntry) -> Context {
     Context {
-        rsp: prepare_slot(stack),
+        rsp: prepare_slot(stack, task_start as *const () as usize),
         rflags: INITIAL_RFLAGS,
         rbx: entry as usize as u64,
         ..Context::default()
     }
 }
 
+/// Prepares a forked child to resume the parent's syscall return path.
+///
+/// The child starts directly in `fork_child_start`, not in `task_start`:
+/// `task_start` enables interrupts before calling the entry point, and an IRQ
+/// taken there would push a trap frame on top of the frame copy below.
 pub fn prepare_fork_stack(stack: &mut [u8], frame: &SyscallFrame) -> Context {
     let top = (stack.as_mut_ptr() as usize + stack.len()) & !0xF;
-    let frame_ptr = (top - 256) as *mut SyscallFrame;
+    let frame_ptr = (top - FORK_FRAME_OFFSET) as *mut SyscallFrame;
     unsafe {
         core::ptr::copy_nonoverlapping(frame, frame_ptr, 1);
+        // The child returns 0 from `fork`; every other register is inherited.
         (*frame_ptr).rax = 0;
     }
     Context {
-        rsp: prepare_slot(stack),
+        rsp: prepare_slot(stack, fork_child_start as *const () as usize),
         rflags: INITIAL_RFLAGS,
-        rbx: fork_child_start as *const () as usize as u64,
         r12: frame_ptr as u64,
         ..Context::default()
     }

@@ -1,4 +1,7 @@
+use super::pipe::PipeEnd;
 use super::vfs::{File, NodeId};
+use alloc::sync::Arc;
+use core::fmt;
 
 pub const MAX_FDS: usize = 16;
 
@@ -9,11 +12,39 @@ pub enum FdError {
     NoProcess,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum FdEntry {
     Keyboard,
     Console,
     File(File),
+    /// A pipe endpoint. Cloning shares the pipe, which is what makes `fork`
+    /// inherit both ends and why an end closes only when every descriptor
+    /// referring to it is gone.
+    Pipe(Arc<PipeEnd>),
+}
+
+impl PartialEq for FdEntry {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (FdEntry::Keyboard, FdEntry::Keyboard) | (FdEntry::Console, FdEntry::Console) => true,
+            (FdEntry::File(left), FdEntry::File(right)) => left == right,
+            (FdEntry::Pipe(left), FdEntry::Pipe(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FdEntry {}
+
+impl fmt::Debug for FdEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FdEntry::Keyboard => formatter.write_str("Keyboard"),
+            FdEntry::Console => formatter.write_str("Console"),
+            FdEntry::File(file) => formatter.debug_tuple("File").field(file).finish(),
+            FdEntry::Pipe(end) => formatter.debug_tuple("Pipe").field(end).finish(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -54,31 +85,68 @@ impl FdTable {
         self.entries[2] = Some(FdEntry::Console);
     }
 
-    pub fn open_file(&mut self, node: NodeId) -> Result<u32, FdError> {
-        for fd in 3..MAX_FDS {
+    /// Table with every descriptor closed.
+    ///
+    /// Used when a process exits: the descriptor table is dropped immediately
+    /// while the process stays behind as a zombie.
+    pub const fn empty() -> Self {
+        Self {
+            entries: [
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None,
+            ],
+        }
+    }
+
+    /// Installs `entry` at the lowest free descriptor.
+    pub fn install(&mut self, entry: FdEntry) -> Result<u32, FdError> {
+        for fd in 0..MAX_FDS {
             if self.entries[fd].is_none() {
-                self.entries[fd] = Some(FdEntry::File(File::new(node)));
+                self.entries[fd] = Some(entry);
                 return Ok(fd as u32);
             }
         }
         Err(FdError::NoFreeFd)
     }
 
-    pub fn close(&mut self, fd: u32) -> Result<(), FdError> {
-        if fd < 3 || fd as usize >= MAX_FDS {
+    pub fn open_file(&mut self, node: NodeId) -> Result<u32, FdError> {
+        self.install(FdEntry::File(File::new(node)))
+    }
+
+    /// Number of descriptors that can still be allocated.
+    pub fn free_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_none()).count()
+    }
+
+    /// Removes and returns a descriptor without dropping it under the caller's
+    /// lock. Close paths use this so pipe teardown can wake peers safely.
+    pub fn take(&mut self, fd: u32) -> Result<FdEntry, FdError> {
+        if fd as usize >= MAX_FDS {
             return Err(FdError::InvalidFd);
         }
-        match self.entries[fd as usize].take() {
-            Some(_) => Ok(()),
-            None => Err(FdError::InvalidFd),
+        self.entries[fd as usize].take().ok_or(FdError::InvalidFd)
+    }
+
+    /// Removes `fd` and hands the entry back to the caller.
+    ///
+    /// Descriptors 0-2 are the standard console descriptors and cannot be
+    /// closed. The entry is returned rather than dropped here so that a close
+    /// path holding the scheduler lock can release a pipe endpoint (whose
+    /// destructor wakes blocked peers) after unlocking.
+    pub fn close(&mut self, fd: u32) -> Result<FdEntry, FdError> {
+        if fd < 3 {
+            return Err(FdError::InvalidFd);
         }
+        self.take(fd)
     }
 
     pub fn entry(&self, fd: u32) -> Result<FdEntry, FdError> {
         if fd as usize >= MAX_FDS {
             return Err(FdError::InvalidFd);
         }
-        self.entries[fd as usize].ok_or(FdError::InvalidFd)
+        self.entries[fd as usize]
+            .clone()
+            .ok_or(FdError::InvalidFd)
     }
 
     pub fn set_offset(&mut self, fd: u32, offset: u64) -> Result<(), FdError> {
