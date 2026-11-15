@@ -45,6 +45,8 @@ pub mod pid;
 pub mod queue;
 #[path = "../../src/proc/reap.rs"]
 pub mod reap;
+#[path = "../../src/proc/signal.rs"]
+pub mod signal;
 #[path = "../../src/mm/uaccess.rs"]
 pub mod uaccess;
 #[path = "../../src/syscall/abi.rs"]
