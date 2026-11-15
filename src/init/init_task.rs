@@ -87,5 +87,8 @@ fn commit(image: ExecImage) -> ! {
     };
     cpu::write_cr3(new_root);
     drop(old);
+    if scheduler::reset_signals_for_exec().is_err() {
+        panic!("kernel_execve: cannot reset signal state");
+    }
     context::enter_user(entry, stack_top)
 }

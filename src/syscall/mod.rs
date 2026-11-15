@@ -12,7 +12,8 @@ use crate::fs::fd::{FdEntry, FdError};
 use crate::fs::pipe::{self, PipeDirection};
 use crate::fs::vfs::{FileType, VfsError};
 use crate::mm::uaccess;
-use crate::proc::scheduler::{self, ForkError, SchedulerError, WaitResult};
+use crate::proc::scheduler::{self, ForkError, SchedulerError, SignalError, WaitResult};
+use crate::proc::signal::{SigAction, SigSet, Signal};
 use crate::proc::wait::WaitTarget;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -47,11 +48,14 @@ pub extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         Some(abi::Syscall::Close) => sys_close(arg0),
         Some(abi::Syscall::Stat) => sys_stat(arg0, arg1),
         Some(abi::Syscall::Lseek) => sys_lseek(arg0, arg1, arg2),
+        Some(abi::Syscall::RtSigaction) => sys_sigaction(frame, arg0, arg1, arg2),
+        Some(abi::Syscall::RtSigprocmask) => sys_sigprocmask(frame, arg0, arg1, arg2),
         Some(abi::Syscall::Pipe) => sys_pipe(arg0),
         Some(abi::Syscall::GetPid) => sys_getpid(),
         Some(abi::Syscall::Fork) => sys_fork(frame),
         Some(abi::Syscall::Execve) => sys_execve(frame, arg0, arg1, arg2),
         Some(abi::Syscall::WaitPid) => sys_waitpid(arg0, arg1, arg2),
+        Some(abi::Syscall::Kill) => sys_kill(arg0, arg1),
         Some(abi::Syscall::Exit) => sys_exit(arg0),
         None => abi::errno(abi::ENOSYS),
     }
@@ -330,6 +334,9 @@ fn sys_execve(frame: &mut SyscallFrame, path: u64, argv: u64, envp: u64) -> u64 
     };
     cpu::write_cr3(new_root);
     drop(old);
+    // The image is committed; there is no error path left. Exec keeps the
+    // blocked mask but resets caught dispositions and discards pending signals.
+    let _ = scheduler::reset_signals_for_exec();
     frame.r15 = 0;
     frame.r14 = 0;
     frame.r13 = 0;
@@ -371,8 +378,8 @@ fn sys_waitpid(pid: u64, status: u64, options: u64) -> u64 {
     };
     loop {
         match scheduler::try_wait(target) {
-            WaitResult::Reaped(child, code) => {
-                let wait_status = (code & 0xFF) << 8;
+            WaitResult::Reaped(child, exit_status) => {
+                let wait_status = exit_status.wait_status();
                 unsafe {
                     core::ptr::write_unaligned(status as *mut i32, wait_status);
                 }
@@ -401,6 +408,118 @@ fn sys_getpid() -> u64 {
 
 fn sys_exit(code: u64) -> u64 {
     scheduler::exit_current(code as i32)
+}
+
+fn sys_kill(pid: u64, signal: u64) -> u64 {
+    // The signal argument is an `int`; the ABI leaves the high half
+    // unspecified, so inspect only the low 32 bits.
+    let raw_signal = signal as i32;
+    if raw_signal < 0 {
+        return abi::errno(abi::EINVAL);
+    }
+    let signal = if raw_signal == 0 {
+        None
+    } else {
+        match u8::try_from(raw_signal).ok().and_then(Signal::from_u8) {
+            Some(signal) => Some(signal),
+            None => return abi::errno(abi::EINVAL),
+        }
+    };
+
+    let result = match pid as i32 {
+        target if target > 0 => match signal {
+            Some(signal) => scheduler::send_signal(target as u32, signal),
+            None => scheduler::check_signal_target(target as u32),
+        },
+        // No process groups: pid 0 means the calling process.
+        0 => match scheduler::current_pid() {
+            Some(current) => match signal {
+                Some(signal) => scheduler::send_signal(current, signal),
+                None => Ok(()),
+            },
+            None => Err(SignalError::NoCurrentProcess),
+        },
+        // Broadcast to every process this one may signal, except init and self.
+        -1 => scheduler::send_signal_all(signal),
+        _ => return abi::errno(abi::EINVAL),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => signal_errno(error),
+    }
+}
+
+fn sys_sigaction(frame: &SyscallFrame, sig: u64, act: u64, oldact: u64) -> u64 {
+    if frame.r10 != abi::SIGSET_SIZE as u64 {
+        return abi::errno(abi::EINVAL);
+    }
+    let signal = match u8::try_from(sig).ok().and_then(Signal::from_u8) {
+        Some(signal) => signal,
+        None => return abi::errno(abi::EINVAL),
+    };
+    // SIGKILL/SIGSTOP have no queryable disposition, as on Linux.
+    if signal.is_uncatchable() {
+        return abi::errno(abi::EINVAL);
+    }
+    let action_size = size_of::<abi::KernelSigAction>();
+    if act != 0 && !uaccess::range_valid(act as usize, action_size) {
+        return abi::errno(abi::EFAULT);
+    }
+    if oldact != 0 && !uaccess::range_valid(oldact as usize, action_size) {
+        return abi::errno(abi::EFAULT);
+    }
+
+    let previous = if act != 0 {
+        let raw = unsafe { core::ptr::read_unaligned(act as *const abi::KernelSigAction) };
+        match scheduler::install_signal_action(signal, action_from_user(raw)) {
+            Ok(previous) => previous,
+            Err(error) => return signal_errno(error),
+        }
+    } else {
+        match scheduler::signal_action(signal) {
+            Ok(action) => action,
+            Err(error) => return signal_errno(error),
+        }
+    };
+
+    if oldact != 0 {
+        let outgoing = action_to_user(previous);
+        unsafe { core::ptr::write_unaligned(oldact as *mut abi::KernelSigAction, outgoing) };
+    }
+    0
+}
+
+fn sys_sigprocmask(frame: &SyscallFrame, how: u64, set: u64, oldset: u64) -> u64 {
+    if frame.r10 != abi::SIGSET_SIZE as u64 {
+        return abi::errno(abi::EINVAL);
+    }
+    if how > scheduler::SIG_SETMASK {
+        return abi::errno(abi::EINVAL);
+    }
+    if set != 0 && !uaccess::range_valid(set as usize, abi::SIGSET_SIZE) {
+        return abi::errno(abi::EFAULT);
+    }
+    if oldset != 0 && !uaccess::range_valid(oldset as usize, abi::SIGSET_SIZE) {
+        return abi::errno(abi::EFAULT);
+    }
+
+    let previous = if set != 0 {
+        let bits = unsafe { core::ptr::read_unaligned(set as *const u64) };
+        match scheduler::set_blocked_signals(how, SigSet::from_bits(bits)) {
+            Ok(previous) => previous,
+            Err(error) => return signal_errno(error),
+        }
+    } else {
+        match scheduler::blocked_signals() {
+            Ok(previous) => previous,
+            Err(error) => return signal_errno(error),
+        }
+    };
+
+    if oldset != 0 {
+        unsafe { core::ptr::write_unaligned(oldset as *mut u64, previous.bits()) };
+    }
+    0
 }
 
 fn user_path(pointer: u64) -> Result<String, u64> {
@@ -473,6 +592,36 @@ fn user_string(pointer: u64) -> Result<String, u64> {
         bytes.push(byte);
     }
     Err(abi::errno(abi::E2BIG))
+}
+
+fn action_from_user(raw: abi::KernelSigAction) -> SigAction {
+    SigAction {
+        handler: raw.handler,
+        flags: raw.flags,
+        restorer: raw.restorer,
+        mask: SigSet::from_bits(raw.mask),
+    }
+}
+
+fn action_to_user(action: SigAction) -> abi::KernelSigAction {
+    abi::KernelSigAction {
+        handler: action.handler,
+        flags: action.flags,
+        restorer: action.restorer,
+        mask: action.mask.bits(),
+    }
+}
+
+fn signal_errno(error: SignalError) -> u64 {
+    match error {
+        SignalError::NotInitialized | SignalError::NoCurrentProcess => abi::errno(abi::ESRCH),
+        SignalError::NoSuchProcess => abi::errno(abi::ESRCH),
+        SignalError::PermissionDenied => abi::errno(abi::EPERM),
+        SignalError::Uncatchable
+        | SignalError::UnsupportedFlags
+        | SignalError::InvalidHandler
+        | SignalError::InvalidHow => abi::errno(abi::EINVAL),
+    }
 }
 
 fn fd_errno(error: FdError) -> u64 {

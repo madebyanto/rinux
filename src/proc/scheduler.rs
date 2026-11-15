@@ -1,8 +1,9 @@
 use super::context::{self, Context};
 use super::pid::{Pid, PidAllocator, INIT_PID};
-use super::process::{Process, ProcessState, TaskEntry};
+use super::process::{ExitStatus, Process, ProcessState, SignalState, TaskEntry};
 use super::queue::{ReadyQueue, MAX_PROCESSES};
 use super::reap::ReapList;
+use super::signal::{SigAction, SigSet, Signal};
 use super::wait::WaitTarget;
 use super::wait_queue::{PidQueue, QueueError};
 use crate::arch::x86_64::cpu;
@@ -11,12 +12,17 @@ use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::fs::fd::{FdEntry, FdError, FdTable};
 use crate::fs::pipe::PipeDirection;
 use crate::mm::address_space::AddressSpace;
-use crate::mm::paging;
+use crate::mm::{paging, uaccess};
 use crate::sync::SpinLock;
 use alloc::sync::Arc;
 
 pub const TIMESLICE_TICKS: u32 = 10;
 pub const TIMESLICE_MS: u64 = 100;
+
+/// `rt_sigprocmask` operations, using the Linux values.
+pub const SIG_BLOCK: u64 = 0;
+pub const SIG_UNBLOCK: u64 = 1;
+pub const SIG_SETMASK: u64 = 2;
 
 /// Fixed number of pipes that can have tasks blocked on them at once.
 pub const MAX_PIPES: usize = 32;
@@ -50,9 +56,27 @@ pub enum ForkError {
     QueueFull,
 }
 
+/// Failures of the signal entry points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalError {
+    NotInitialized,
+    NoCurrentProcess,
+    NoSuchProcess,
+    /// Signals to PID 1 are reserved to PID 1 itself.
+    PermissionDenied,
+    /// `SIGKILL`/`SIGSTOP` cannot be caught or queried.
+    Uncatchable,
+    /// Unknown `sa_flags` bits.
+    UnsupportedFlags,
+    /// A handler or restorer outside the user program window.
+    InvalidHandler,
+    /// Unknown `rt_sigprocmask` operation.
+    InvalidHow,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitResult {
-    Reaped(Pid, i32),
+    Reaped(Pid, ExitStatus),
     Block,
     NoChild,
 }
@@ -152,6 +176,66 @@ impl Scheduler {
                 && target.matches(process.pid)
                 && process.state == ProcessState::Zombie
         })
+    }
+
+    fn process(&self, pid: Pid) -> Option<&Process> {
+        self.processes
+            .iter()
+            .flatten()
+            .find(|process| process.pid == pid)
+    }
+
+    /// Rinux has no credentials yet, so every process shares one identity.
+    /// PID 1 is the exception: it must survive to reap orphans, so only init
+    /// may signal itself.
+    fn can_signal(&self, sender: Pid, target: Pid) -> Result<(), SignalError> {
+        if self.process(target).is_none() {
+            return Err(SignalError::NoSuchProcess);
+        }
+        if target == INIT_PID && sender != INIT_PID {
+            return Err(SignalError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn queue_signal(&mut self, target: Pid, signal: Signal) -> Result<(), SignalError> {
+        let process = self
+            .process_mut(target)
+            .ok_or(SignalError::NoSuchProcess)?;
+        process.signals.pending.insert(signal);
+        let wake =
+            process.state == ProcessState::Blocked && process.signals.needs_delivery(signal);
+        if wake {
+            self.wake_for_signal(target);
+        }
+        Ok(())
+    }
+
+    /// Moves a blocked task back to the ready queue after a signal arrived.
+    ///
+    /// The task may be registered in any wait queue (keyboard, either pipe
+    /// side). Every registration is removed so a later wakeup cannot resurrect
+    /// a stale entry, and `waiting_for` is cleared for the same reason.
+    fn wake_for_signal(&mut self, pid: Pid) {
+        let blocked = self
+            .process_mut(pid)
+            .map(|process| process.state == ProcessState::Blocked)
+            .unwrap_or(false);
+        if !blocked {
+            return;
+        }
+        let _ = self.ready.remove(pid);
+        let _ = self.keyboard_waiters.remove(pid);
+        for waiters in self.pipe_waiters.iter_mut() {
+            let _ = waiters.readers.remove(pid);
+            let _ = waiters.writers.remove(pid);
+        }
+        if let Some(process) = self.process_mut(pid) {
+            process.state = ProcessState::Ready;
+            process.waiting_for = None;
+            process.signals.interrupted = true;
+        }
+        let _ = self.ready.push(pid);
     }
 }
 
@@ -317,7 +401,7 @@ pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
         let mut guard = SCHEDULER.lock();
         let scheduler = guard.as_mut().ok_or(ForkError::NoCurrent)?;
         let parent_pid = scheduler.current.ok_or(ForkError::NoCurrent)?;
-        let (address_space, fds) = {
+        let (address_space, fds, signals) = {
             let parent = scheduler
                 .process_mut(parent_pid)
                 .ok_or(ForkError::NoCurrent)?;
@@ -325,7 +409,11 @@ pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
                 .address_space
                 .clone_user()
                 .map_err(|_| ForkError::OutOfMemory)?;
-            (address_space, parent.fds.clone())
+            (
+                address_space,
+                parent.fds.clone(),
+                SignalState::forked(&parent.signals),
+            )
         };
         let slot = scheduler
             .processes
@@ -338,7 +426,7 @@ pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
                 return Err(ForkError::PidExhausted);
             }
         };
-        let process = Process::new_fork(pid, parent_pid, address_space, fds, frame)
+        let process = Process::new_fork(pid, parent_pid, address_space, fds, signals, frame)
             .map_err(|_| ForkError::OutOfMemory)?;
         scheduler.processes[slot] = Some(process);
         if scheduler.ready.push(pid).is_err() {
@@ -372,6 +460,178 @@ pub fn resolve_cow_fault(virt_addr: usize) -> bool {
             }
             _ => false,
         }
+    })
+}
+
+/// Queues `signal` for `target`, waking it when the signal needs service.
+pub fn send_signal(target: Pid, signal: Signal) -> Result<(), SignalError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
+        let sender = scheduler.current.ok_or(SignalError::NoCurrentProcess)?;
+        scheduler.can_signal(sender, target)?;
+        scheduler.queue_signal(target, signal)
+    })
+}
+
+/// Broadcast form of [`send_signal`], used by `kill(-1, sig)`.
+///
+/// PID 1 and the caller are skipped; a `None` signal performs the existence
+/// check without queueing anything.
+pub fn send_signal_all(signal: Option<Signal>) -> Result<(), SignalError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
+        let sender = scheduler.current.ok_or(SignalError::NoCurrentProcess)?;
+        let mut targets = [None; MAX_PROCESSES];
+        let mut count = 0;
+        for process in scheduler.processes.iter().flatten() {
+            if process.pid == sender || process.pid == INIT_PID {
+                continue;
+            }
+            if count == MAX_PROCESSES {
+                break;
+            }
+            targets[count] = Some(process.pid);
+            count += 1;
+        }
+        if let Some(signal) = signal {
+            for target in targets.iter().take(count).flatten() {
+                if scheduler.can_signal(sender, *target).is_ok() {
+                    let _ = scheduler.queue_signal(*target, signal);
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Existence and permission check for `kill(pid, 0)`.
+pub fn check_signal_target(target: Pid) -> Result<(), SignalError> {
+    cpu::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let scheduler = guard.as_ref().ok_or(SignalError::NotInitialized)?;
+        let sender = scheduler.current.ok_or(SignalError::NoCurrentProcess)?;
+        scheduler.can_signal(sender, target)
+    })
+}
+
+/// Installs `action` for `signal` and returns the previous disposition.
+pub fn install_signal_action(
+    signal: Signal,
+    action: SigAction,
+) -> Result<SigAction, SignalError> {
+    if signal.is_uncatchable() {
+        return Err(SignalError::Uncatchable);
+    }
+    if !action.flags_supported() {
+        return Err(SignalError::UnsupportedFlags);
+    }
+    if action.is_caught() && !uaccess::program_valid(action.handler as usize, 1) {
+        return Err(SignalError::InvalidHandler);
+    }
+    if action.uses_restorer() && !uaccess::program_valid(action.restorer as usize, 1) {
+        return Err(SignalError::InvalidHandler);
+    }
+    let action = SigAction {
+        mask: action.mask.without_uncatchable(),
+        ..action
+    };
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
+        let pid = scheduler
+            .current
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let process = scheduler
+            .process_mut(pid)
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let previous = process.signals.actions[signal.index()];
+        process.signals.actions[signal.index()] = action;
+        Ok(previous)
+    })
+}
+
+/// Reads the current disposition of `signal`.
+pub fn signal_action(signal: Signal) -> Result<SigAction, SignalError> {
+    if signal.is_uncatchable() {
+        return Err(SignalError::Uncatchable);
+    }
+    cpu::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let scheduler = guard.as_ref().ok_or(SignalError::NotInitialized)?;
+        let pid = scheduler
+            .current
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let process = scheduler
+            .process(pid)
+            .ok_or(SignalError::NoCurrentProcess)?;
+        Ok(process.signals.actions[signal.index()])
+    })
+}
+
+/// Returns the calling process's current blocked-signal mask.
+pub fn blocked_signals() -> Result<SigSet, SignalError> {
+    cpu::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let scheduler = guard.as_ref().ok_or(SignalError::NotInitialized)?;
+        let pid = scheduler
+            .current
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let process = scheduler
+            .process(pid)
+            .ok_or(SignalError::NoCurrentProcess)?;
+        Ok(process.signals.blocked)
+    })
+}
+
+/// Applies `rt_sigprocmask`'s `how`/`set` to the calling process and returns
+/// the previous mask. `SIGKILL` and `SIGSTOP` are silently removed.
+pub fn set_blocked_signals(how: u64, set: SigSet) -> Result<SigSet, SignalError> {
+    let set = set.without_uncatchable();
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
+        let pid = scheduler
+            .current
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let process = scheduler
+            .process_mut(pid)
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let previous = process.signals.blocked;
+        let updated = match how {
+            SIG_BLOCK => previous.union(set),
+            SIG_UNBLOCK => previous.difference(set),
+            SIG_SETMASK => set,
+            _ => return Err(SignalError::InvalidHow),
+        };
+        process.signals.blocked = updated.without_uncatchable();
+        Ok(previous)
+    })
+}
+
+/// Exec resets: caught dispositions become `SIG_DFL`, ignored ones stay
+/// ignored, pending signals are discarded and handler nesting restarts.
+pub fn reset_signals_for_exec() -> Result<(), SignalError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
+        let pid = scheduler
+            .current
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let process = scheduler
+            .process_mut(pid)
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let signals = &mut process.signals;
+        for action in signals.actions.iter_mut() {
+            if action.is_caught() {
+                *action = SigAction::DEFAULT;
+            }
+        }
+        signals.pending = SigSet::EMPTY;
+        signals.depth = 0;
+        signals.interrupted = false;
+        Ok(())
     })
 }
 
@@ -548,11 +808,11 @@ pub fn try_wait(target: WaitTarget) -> WaitResult {
         if let Some(index) = reap {
             let process = scheduler.processes[index].take();
             let pid = process.as_ref().map(|process| process.pid).unwrap_or(0);
-            let code = process
+            let status = process
                 .as_ref()
-                .and_then(|process| process.exit_code)
-                .unwrap_or(0);
-            (WaitResult::Reaped(pid, code), process)
+                .and_then(|process| process.exit_status)
+                .unwrap_or(ExitStatus::Exited(0));
+            (WaitResult::Reaped(pid, status), process)
         } else if matched {
             (WaitResult::Block, None)
         } else {
@@ -703,7 +963,7 @@ pub fn exit_current(code: i32) -> ! {
                 let parent = match scheduler.process_mut(pid) {
                     Some(process) => {
                         process.state = ProcessState::Zombie;
-                        process.exit_code = Some(code);
+                        process.exit_status = Some(ExitStatus::Exited(code));
                         orphaned_fds = Some(core::mem::replace(
                             &mut process.fds,
                             FdTable::empty(),
