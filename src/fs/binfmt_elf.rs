@@ -12,6 +12,7 @@ use crate::mm::address_space::AddressSpace;
 use crate::mm::uaccess::{
     PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, STACK_PAGES, STACK_SIZE, STACK_TOP,
 };
+use crate::syscall::abi;
 use alloc::vec::Vec;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
@@ -20,6 +21,7 @@ const PAGE_SIZE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadError {
+    InvalidPath,
     Vfs(VfsError),
     Elf(ElfError),
     OutOfMemory,
@@ -27,6 +29,27 @@ pub enum LoadError {
     FileTooLarge,
     NotRegular,
     ReadFailed,
+}
+
+impl LoadError {
+    /// Maps a loader failure to a Linux errno value (positive).
+    pub fn errno(self) -> i64 {
+        match self {
+            LoadError::InvalidPath => abi::EINVAL,
+            LoadError::Vfs(VfsError::NotFound) => abi::ENOENT,
+            LoadError::Vfs(VfsError::NotDirectory) => abi::ENOTDIR,
+            LoadError::Vfs(VfsError::NotFile) => abi::EISDIR,
+            LoadError::Vfs(VfsError::InvalidPath) => abi::EINVAL,
+            LoadError::Vfs(_) => abi::EIO,
+            LoadError::Elf(ElfError::StackOverflow)
+            | LoadError::Elf(ElfError::TooManyArguments)
+            | LoadError::Elf(ElfError::StringTooLong) => abi::E2BIG,
+            LoadError::Elf(_) => abi::ENOEXEC,
+            LoadError::OutOfMemory | LoadError::MapFailed => abi::ENOMEM,
+            LoadError::FileTooLarge | LoadError::ReadFailed => abi::ENOEXEC,
+            LoadError::NotRegular => abi::EISDIR,
+        }
+    }
 }
 
 impl From<VfsError> for LoadError {
@@ -44,6 +67,7 @@ impl From<ElfError> for LoadError {
 impl core::fmt::Display for LoadError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            LoadError::InvalidPath => write!(formatter, "invalid executable path"),
             LoadError::Vfs(error) => write!(formatter, "{}", error),
             LoadError::Elf(error) => write!(formatter, "ELF error {:?}", error),
             LoadError::OutOfMemory => write!(formatter, "out of memory"),
@@ -61,7 +85,36 @@ pub struct ExecImage {
     pub address_space: AddressSpace,
 }
 
-pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<ExecImage, LoadError> {
+/// An executable file read into memory, ready for ELF validation.
+pub struct ExecFile {
+    data: Vec<u8>,
+}
+
+impl ExecFile {
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// Pipeline stage 1: reject paths that cannot name a kernel executable.
+pub fn validate_path(path: &str) -> Result<(), LoadError> {
+    if path.is_empty() || path.as_bytes().contains(&0) {
+        return Err(LoadError::InvalidPath);
+    }
+    Ok(())
+}
+
+/// Pipeline stage 1 for init discovery: the path must also be absolute.
+pub fn validate_init_path(path: &str) -> Result<(), LoadError> {
+    validate_path(path)?;
+    if !path.starts_with('/') {
+        return Err(LoadError::InvalidPath);
+    }
+    Ok(())
+}
+
+/// Pipeline stage 2: stat and open the file, then read it into memory.
+pub fn open_executable(path: &str) -> Result<ExecFile, LoadError> {
     let stat = crate::fs::stat_path(path)?;
     if stat.kind != FileType::Regular {
         return Err(LoadError::NotRegular);
@@ -86,8 +139,26 @@ pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<ExecImage, LoadE
     if offset != size {
         return Err(LoadError::ReadFailed);
     }
+    Ok(ExecFile { data })
+}
 
-    let image = elf::parse(&data, PROGRAM_BASE as u64, PROGRAM_SIZE as u64)?;
+/// Pipeline stage 3: validate the ELF headers and load segments.
+pub fn validate_elf(file: &ExecFile) -> Result<elf::Image, LoadError> {
+    Ok(elf::parse(
+        file.bytes(),
+        PROGRAM_BASE as u64,
+        PROGRAM_SIZE as u64,
+    )?)
+}
+
+/// Pipeline stage 4: allocate and populate the new user address space.
+pub fn build_image(
+    file: &ExecFile,
+    image: &elf::Image,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<ExecImage, LoadError> {
+    let data = file.bytes();
     let mut address_space = AddressSpace::new().map_err(|_| LoadError::OutOfMemory)?;
 
     for segment in image.segments() {
@@ -182,6 +253,22 @@ pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<ExecImage, LoadE
         stack_top: stack_pointer,
         address_space,
     })
+}
+
+/// Runs stages 1-4 for an already resolved path.
+pub fn prepare(path: &str, argv: &[&str], envp: &[&str]) -> Result<ExecImage, LoadError> {
+    validate_path(path)?;
+    let file = open_executable(path)?;
+    let image = validate_elf(&file)?;
+    build_image(&file, &image, argv, envp)
+}
+
+/// Loads an executable for `execve` from user space.
+///
+/// Kernel-space init discovery uses the individual pipeline stages directly so
+/// it can report which candidate failed.
+pub fn load(path: &str, argv: &[&str], envp: &[&str]) -> Result<ExecImage, LoadError> {
+    prepare(path, argv, envp)
 }
 
 fn align_up(value: u64) -> Option<u64> {

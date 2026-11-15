@@ -9,7 +9,7 @@ Hobby x86-64 kernel in Rust (`no_std`, no external crates), booted by Multiboot2
 - `make run` boots the ISO plus an external root filesystem image attached as an IDE disk. Set `ROOTFS=/path/to/rootfs.img`; the default is `build/rootfs.img`. The target fails fast with a `ROOTFS is required` message when the file is missing.
 - `KERNEL_CMDLINE` is injected into the GRUB entry (default `root=/dev/hda1`). Empty it to exercise the default init lookup.
 - `make debug` adds a gdb stub (`-s -S`, :1234); symbols are at `target/x86_64-rinux/debug/rinux`.
-- Headless smoke test (with a root filesystem): `timeout 10 make run QEMU='qemu-system-x86_64 -display none' ROOTFS=/path/to/rootfs.img`. Timeout exits 124; look for `Rinux 0.1.0`, `cmdline:` diagnostics, ext2 mount messages, and `elf: loaded`. Without `ROOTFS`, expect the fail-fast message instead.
+- Headless smoke test (with a root filesystem): `timeout 10 make run QEMU='qemu-system-x86_64 -display none' ROOTFS=/path/to/rootfs.img`. Timeout exits 124; look for `Rinux 0.1.0`, `cmdline:` diagnostics, ext2 mount messages, and `Run <path> as init process`. Without `ROOTFS`, expect the fail-fast message instead.
 - `make check` (or `cargo check`) no longer runs a `build.rs`; GNU `as` and `ld` are not needed for type-checking or the kernel build. `objcopy`, `grub-mkrescue`, and `xorriso` are needed for `make image`.
 - Prerequisites beyond the README: binutils (`objcopy`), `grub-mkrescue` + `xorriso`, QEMU, and nightly with `rust-src` (see `rust-toolchain.toml`). `mke2fs` is needed only by `ext2_tests`.
 - `make clean` runs `cargo clean` and removes `build/`; it does not clean `host-tests/target`.
@@ -33,11 +33,12 @@ Do not run `cargo test` inside the repo (even from `host-tests/`): Cargo merges 
 ## Architecture notes
 
 - Boot: `_start` in `src/arch/x86_64/boot.S` → `rust_main` in `src/main.rs`; linked at 1 MiB by `linker.ld`.
-- Modules: `arch/x86_64` (CPU, GDT/IDT/TSS, PIC/PIT, serial/VGA, Multiboot2, syscall entry), `mm` (refcounted frame allocator for the first 1 GiB, heap, 4 KiB paging, per-process address spaces, COW, `uaccess`), `proc` (preemptive round-robin scheduler, 100 ms timeslice), `fs` (read-only ext2 + VFS over ATA PIO/MBR, ELF loader), `init` (early command line), `syscall`, `sync`, `drivers`.
+- Modules: `arch/x86_64` (CPU, GDT/IDT/TSS, PIC/PIT, serial/VGA, Multiboot2, syscall entry), `mm` (refcounted frame allocator for the first 1 GiB, heap, 4 KiB paging, per-process address spaces, COW, `uaccess`), `proc` (preemptive round-robin scheduler, 100 ms timeslice, PID 1 protection, orphan reparenting), `fs` (read-only ext2 + VFS over ATA PIO/MBR, staged ELF loader), `init` (early command line, `kernel_init`, init discovery), `syscall`, `sync`, `drivers`.
 - ELF loading lives in `src/fs/binfmt_elf.rs` (`ExecImage`); user-pointer validation and the fixed address layout live in `src/mm/uaccess.rs`. There is no user-space source, `build.rs`, or disk-image recipe in this repository.
 - The kernel has zero dependencies by design and uses `alloc`, a custom `SpinLock`/heap, and `panic = "abort"`. The target disables MMX/SSE (soft-float) and the red zone: no FP/SIMD or std-only crates.
 - `make image` deliberately runs `objcopy -I elf64-x86-64 -O elf32-i386` on the kernel for GRUB; do not remove it.
-- User space is fixed and tiny: one PML4 slot, a 64 KiB program window at `0x80_0000_0000`, and a 16 KiB stack below `0x80_0020_0000`. The root filesystem and its `/bin/init.elf` are supplied externally through `ROOTFS`.
+- User space is fixed and tiny: one PML4 slot, a 64 KiB program window at `0x80_0000_0000`, and a 16 KiB stack below `0x80_0020_0000`. The root filesystem is supplied externally through `ROOTFS`.
+- PID 1 is `kernel_init`, the first spawned kernel thread. It tries `init=` first, then `/sbin/init`, `/etc/init`, `/bin/init`, and `/bin/sh`, and panics if none runs. `kernel_execve` replaces the current address space in place, preserving the process slot, PID, parent link, and file descriptors. Orphans are reparented to PID 1, and exiting PID 1 panics.
 - Syscalls use the `syscall`/`sysretq` instructions (not `int 0x80`). The Rust syscall table/errno live in `src/syscall/abi.rs` (Linux x86-64 numbers, errno encoded negative) and are shared with host tests; external user programs hardcode the same numbers.
 - Frames are refcounted (`retain_frame` per extra owner, `free_frame` decrements). `fork` maps user pages copy-on-write; write faults go through `AddressSpace::handle_cow_fault`.
 - ext2 is read-only (writes return `EROFS`). The guest disk is the external `ROOTFS` image; the kernel expects an MBR with an ext2 partition and mounts it via `fs::mount`.

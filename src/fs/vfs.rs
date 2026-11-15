@@ -117,6 +117,7 @@ impl Vfs {
         self.root.read(node, offset, &mut buffer[..limit])
     }
 
+    #[allow(dead_code)]
     pub fn read(&mut self, file: &mut File, buffer: &mut [u8]) -> Result<usize, VfsError> {
         let count = self.read_at(file.node, file.offset, buffer)?;
         file.offset += count as u64;

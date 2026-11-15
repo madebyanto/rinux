@@ -35,21 +35,6 @@ task_start:
     call task_finished
     hlt
 
-.global user_task_start
-user_task_start:
-    push r15
-    push r13
-    push rbp
-    push r14
-    push r12
-    xor ebx, ebx
-    xor ebp, ebp
-    xor r12d, r12d
-    xor r13d, r13d
-    xor r14d, r14d
-    xor r15d, r15d
-    iretq
-
 .global fork_child_start
 fork_child_start:
     mov rsp, r12
@@ -73,3 +58,30 @@ fork_child_start:
     pop r11
     mov rsp, qword ptr [rsp]
     sysretq
+
+.global enter_user_mode
+enter_user_mode:
+    mov rax, rdi
+    mov rdx, rsi
+    push 0x2B
+    push rdx
+    push 0x202
+    push 0x33
+    push rax
+    cld
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+    iretq

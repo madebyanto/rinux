@@ -6,7 +6,7 @@ use crate::fs::fd::FdTable;
 use crate::mm::address_space::AddressSpace;
 use alloc::vec::Vec;
 
-pub type TaskEntry = extern "C" fn();
+pub type TaskEntry = extern "C" fn() -> !;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
@@ -52,28 +52,6 @@ impl Process {
         let address_space = AddressSpace::new().map_err(|_| ProcessError::OutOfMemory)?;
         let (mut kernel_stack, kernel_stack_top) = Self::allocate_stack()?;
         let context = context::prepare_stack(&mut kernel_stack, entry);
-        Ok(Self {
-            pid,
-            state: ProcessState::Ready,
-            kernel_stack,
-            kernel_stack_top,
-            context,
-            address_space,
-            fds: FdTable::new(),
-            parent: None,
-            waiting_for: None,
-            exit_code: None,
-        })
-    }
-
-    pub fn new_user(
-        pid: Pid,
-        entry: u64,
-        stack_top: u64,
-        address_space: AddressSpace,
-    ) -> Result<Self, ProcessError> {
-        let (mut kernel_stack, kernel_stack_top) = Self::allocate_stack()?;
-        let context = context::prepare_user_stack(&mut kernel_stack, entry, stack_top);
         Ok(Self {
             pid,
             state: ProcessState::Ready,

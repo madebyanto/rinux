@@ -22,8 +22,6 @@ use drivers::{ata, ps2};
 use fs::vfs::{DirCursor, FileType};
 use proc::scheduler;
 
-const TASK_REPORT_INTERVAL_MS: u64 = 300;
-
 #[no_mangle]
 pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     serial::init();
@@ -110,23 +108,8 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     if let Err(error) = scheduler::init() {
         fatal("scheduler initialization failed", error);
     }
-    if let Err(error) = scheduler::spawn(task_one) {
-        fatal("task 1 spawn failed", error);
-    }
-    if let Err(error) = scheduler::spawn(task_two) {
-        fatal("task 2 spawn failed", error);
-    }
-    if let Err(error) = scheduler::spawn(task_three) {
-        fatal("task 3 spawn failed", error);
-    }
-    let image = match fs::binfmt_elf::load("/bin/init.elf", &["/bin/init.elf"], &[]) {
-        Ok(image) => image,
-        Err(error) => fatal_display("init ELF load failed", error),
-    };
-    let image_entry = image.entry;
-    let image_stack = image.stack_top;
-    if let Err(error) = scheduler::spawn_user(image_entry, image_stack, image.address_space) {
-        fatal("user task spawn failed", error);
+    if let Err(error) = scheduler::spawn_init(init::init_task::kernel_init) {
+        fatal("kernel_init spawn failed", error);
     }
     if let Err(error) = pic::unmask(0) {
         fatal("PIT IRQ unmask failed", error);
@@ -159,11 +142,6 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     );
     print_ext2(&mount_info);
     kprintln!(
-        "elf: loaded /bin/init.elf, entry {:#x}, stack {:#x}",
-        image_entry,
-        image_stack
-    );
-    kprintln!(
         "gdt: kernel CS/SS {:#x}/{:#x}, user CS/SS {:#x}/{:#x}, TSS {:#x}",
         gdt::KERNEL_CODE,
         gdt::KERNEL_DATA,
@@ -189,43 +167,9 @@ pub extern "C" fn rust_main(multiboot_info: usize) -> ! {
     scheduler::yield_now();
     loop {
         cpu::halt();
-        while let Some(key) = ps2::read_key() {
-            match key {
-                b'\n' => kprintln!(),
-                b'\t' => kprint!("    "),
-                0x20..=0x7E => kprint!("{}", key as char),
-                _ => {}
-            }
-        }
         if ps2::take_magic() {
             unsafe { core::ptr::write_volatile(core::ptr::null_mut::<u64>(), 0) };
         }
-    }
-}
-
-extern "C" fn task_one() {
-    task_body(1)
-}
-
-extern "C" fn task_two() {
-    task_body(2)
-}
-
-extern "C" fn task_three() {
-    task_body(3)
-}
-
-fn task_body(id: u32) -> ! {
-    let mut next_report = 0u64;
-    loop {
-        let now = pit::uptime_ms();
-        if now >= next_report {
-            cpu::without_interrupts(|| {
-                kprintln!("task {} alive, uptime {} ms", id, now);
-            });
-            next_report = now.saturating_add(TASK_REPORT_INTERVAL_MS);
-        }
-        cpu::halt();
     }
 }
 
@@ -264,23 +208,6 @@ fn print_ext2(info: &fs::MountInfo) {
             }
             Ok(None) => break,
             Err(error) => fatal_display("ext2 readdir failed", error),
-        }
-    }
-    kprintln!("ext2: cat /hello.txt");
-    let mut file = match fs::open("/hello.txt") {
-        Ok(file) => file,
-        Err(error) => fatal_display("ext2 open failed", error),
-    };
-    let mut buffer = [0u8; 128];
-    loop {
-        match fs::read(&mut file, &mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                for byte in &buffer[..count] {
-                    console::write_byte(*byte);
-                }
-            }
-            Err(error) => fatal_display("ext2 read failed", error),
         }
     }
 }

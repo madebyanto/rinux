@@ -1,5 +1,5 @@
 use super::context::{self, Context};
-use super::pid::{Pid, PidAllocator};
+use super::pid::{Pid, PidAllocator, INIT_PID};
 use super::process::{Process, ProcessState, TaskEntry};
 use super::queue::{ReadyQueue, MAX_PROCESSES};
 use super::reap::ReapList;
@@ -31,6 +31,7 @@ pub enum SpawnError {
     PidExhausted,
     OutOfMemory,
     QueueFull,
+    InitNotFirst,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,32 +123,13 @@ pub fn spawn(entry: TaskEntry) -> Result<Pid, SpawnError> {
     })
 }
 
-pub fn spawn_user(
-    entry: u64,
-    stack_top: u64,
-    address_space: AddressSpace,
-) -> Result<Pid, SpawnError> {
-    cpu::without_interrupts(|| {
-        let mut guard = SCHEDULER.lock();
-        let scheduler = guard.as_mut().ok_or(SpawnError::NotInitialized)?;
-        let slot = scheduler
-            .processes
-            .iter()
-            .position(|process| process.is_none())
-            .ok_or(SpawnError::NoFreeSlot)?;
-        let pid = scheduler
-            .pids
-            .allocate()
-            .map_err(|_| SpawnError::PidExhausted)?;
-        let process = Process::new_user(pid, entry, stack_top, address_space)
-            .map_err(|_| SpawnError::OutOfMemory)?;
-        scheduler.processes[slot] = Some(process);
-        if scheduler.ready.push(pid).is_err() {
-            scheduler.processes[slot] = None;
-            return Err(SpawnError::QueueFull);
-        }
-        Ok(pid)
-    })
+/// Spawns the first kernel thread and guarantees it owns PID 1.
+pub fn spawn_init(entry: TaskEntry) -> Result<Pid, SpawnError> {
+    let pid = spawn(entry)?;
+    if pid != INIT_PID {
+        return Err(SpawnError::InitNotFirst);
+    }
+    Ok(pid)
 }
 
 pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
@@ -238,6 +220,22 @@ pub fn current_pid() -> Option<Pid> {
     cpu::without_interrupts(|| {
         let guard = SCHEDULER.lock();
         guard.as_ref().and_then(|scheduler| scheduler.current)
+    })
+}
+
+/// Installs fd 0/1/2 for the running process.
+pub fn init_current_stdio() -> Result<(), SchedulerError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SchedulerError::NotInitialized)?;
+        let pid = scheduler
+            .current
+            .ok_or(SchedulerError::NoCurrentProcess)?;
+        let process = scheduler
+            .process_mut(pid)
+            .ok_or(SchedulerError::NoCurrentProcess)?;
+        process.fds.init_stdio();
+        Ok(())
     })
 }
 
@@ -456,6 +454,9 @@ pub fn exit_current(code: i32) -> ! {
         let mut guard = SCHEDULER.lock();
         if let Some(scheduler) = guard.as_mut() {
             if let Some(pid) = scheduler.current {
+                if pid == INIT_PID {
+                    panic!("Attempted to kill init!");
+                }
                 let _ = scheduler.ready.remove(pid);
                 let _ = scheduler.keyboard_waiters.remove(pid);
                 let parent = match scheduler.process_mut(pid) {
@@ -484,19 +485,12 @@ pub fn exit_current(code: i32) -> ! {
                         }
                     }
                 }
-                let mut orphan_zombies = [None; MAX_PROCESSES];
-                let mut orphan_count = 0;
+                // Every orphan is reparented to PID 1, including zombies that
+                // init will later collect with waitpid.
                 for process in scheduler.processes.iter_mut().flatten() {
                     if process.parent == Some(pid) {
-                        process.parent = None;
-                        if process.state == ProcessState::Zombie && orphan_count < MAX_PROCESSES {
-                            orphan_zombies[orphan_count] = Some(process.pid);
-                            orphan_count += 1;
-                        }
+                        process.parent = Some(INIT_PID);
                     }
-                }
-                for orphan in orphan_zombies.iter().take(orphan_count).flatten() {
-                    let _ = scheduler.reap.push(*orphan);
                 }
                 if !parent_alive {
                     let _ = scheduler.reap.push(pid);

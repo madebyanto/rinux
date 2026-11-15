@@ -25,12 +25,6 @@ create_rootfs() {
         mount "${LOOP_DEV}p1" mnt_rootfs
         mkdir -p mnt_rootfs/sbin mnt_rootfs/bin mnt_rootfs/etc
         
-        # Placeholder /sbin/init if none exists yet
-        if [ ! -f mnt_rootfs/sbin/init ]; then
-            touch mnt_rootfs/sbin/init
-            chmod +x mnt_rootfs/sbin/init
-        fi
-        
         umount mnt_rootfs
         rmdir mnt_rootfs
         losetup -d "$LOOP_DEV"

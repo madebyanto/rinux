@@ -124,12 +124,6 @@ pub fn open(path: &str) -> Result<File, VfsError> {
     vfs.open(path)
 }
 
-pub fn read(file: &mut File, buffer: &mut [u8]) -> Result<usize, VfsError> {
-    let mut guard = VFS.lock();
-    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
-    vfs.read(file, buffer)
-}
-
 pub fn stat_path(path: &str) -> Result<Stat, VfsError> {
     let mut guard = VFS.lock();
     let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;

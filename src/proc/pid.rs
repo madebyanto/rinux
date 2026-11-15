@@ -1,5 +1,8 @@
 pub type Pid = u32;
 
+/// The kernel init task, which becomes the ancestor of every orphan.
+pub const INIT_PID: Pid = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PidError {
     Exhausted,

@@ -7,7 +7,7 @@ use crate::drivers::ps2;
 use crate::fs;
 use crate::fs::binfmt_elf;
 use crate::fs::binfmt_elf::LoadError;
-use crate::fs::elf::{self, ElfError};
+use crate::fs::elf;
 use crate::fs::fd::{FdEntry, FdError};
 use crate::fs::vfs::{FileType, VfsError};
 use crate::mm::uaccess;
@@ -409,18 +409,7 @@ fn fork_errno(error: ForkError) -> u64 {
 }
 
 fn load_errno(error: LoadError) -> u64 {
-    match error {
-        LoadError::Vfs(VfsError::NotFound) => abi::errno(abi::ENOENT),
-        LoadError::Vfs(VfsError::NotFile) => abi::errno(abi::EISDIR),
-        LoadError::Vfs(_) => abi::errno(abi::EIO),
-        LoadError::Elf(ElfError::StackOverflow)
-        | LoadError::Elf(ElfError::TooManyArguments)
-        | LoadError::Elf(ElfError::StringTooLong) => abi::errno(abi::E2BIG),
-        LoadError::Elf(_) => abi::errno(abi::ENOEXEC),
-        LoadError::OutOfMemory | LoadError::MapFailed => abi::errno(abi::ENOMEM),
-        LoadError::FileTooLarge | LoadError::ReadFailed => abi::errno(abi::ENOEXEC),
-        LoadError::NotRegular => abi::errno(abi::EISDIR),
-    }
+    abi::errno(error.errno())
 }
 
 fn vfs_errno(error: VfsError) -> u64 {

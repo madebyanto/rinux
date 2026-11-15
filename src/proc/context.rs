@@ -6,9 +6,6 @@ global_asm!(include_str!("../arch/x86_64/context.S"));
 
 pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
 pub const INITIAL_RFLAGS: u64 = 0x002;
-pub const USER_CS: u64 = 0x33;
-pub const USER_SS: u64 = 0x2B;
-pub const USER_RFLAGS: u64 = 0x202;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -38,12 +35,19 @@ const _: () = {
 extern "C" {
     fn context_switch(old: *mut Context, new: *const Context);
     fn task_start();
-    fn user_task_start();
     fn fork_child_start();
+    fn enter_user_mode(entry: u64, stack_top: u64) -> !;
 }
 
 pub unsafe fn switch(old: *mut Context, new: *const Context) {
     context_switch(old, new);
+}
+
+/// Leaves the kernel and starts a ring-3 program on a freshly built stack.
+///
+/// This is used by `kernel_execve`, where no syscall return frame exists.
+pub fn enter_user(entry: u64, stack_top: u64) -> ! {
+    unsafe { enter_user_mode(entry, stack_top) }
 }
 
 fn prepare_slot(stack: &mut [u8]) -> u64 {
@@ -75,19 +79,6 @@ pub fn prepare_fork_stack(stack: &mut [u8], frame: &SyscallFrame) -> Context {
         rbx: fork_child_start as *const () as usize as u64,
         r12: frame_ptr as u64,
         ..Context::default()
-    }
-}
-
-pub fn prepare_user_stack(stack: &mut [u8], user_entry: u64, user_stack_top: u64) -> Context {
-    Context {
-        rsp: prepare_slot(stack),
-        rflags: INITIAL_RFLAGS,
-        rbx: user_task_start as *const () as usize as u64,
-        rbp: USER_RFLAGS,
-        r12: user_entry,
-        r13: user_stack_top,
-        r14: USER_CS,
-        r15: USER_SS,
     }
 }
 

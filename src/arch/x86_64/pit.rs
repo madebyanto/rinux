@@ -26,6 +26,7 @@ pub fn handle_tick() {
     crate::proc::scheduler::on_timer_tick();
 }
 
+#[allow(dead_code)]
 pub fn uptime_ms() -> u64 {
     cpu::without_interrupts(|| *UPTIME_MS.lock())
 }

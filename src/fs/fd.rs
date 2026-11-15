@@ -45,6 +45,15 @@ impl FdTable {
         }
     }
 
+    /// Installs the standard console file descriptors.
+    ///
+    /// fd 0 reads from the keyboard, fd 1 and fd 2 write to the console.
+    pub fn init_stdio(&mut self) {
+        self.entries[0] = Some(FdEntry::Keyboard);
+        self.entries[1] = Some(FdEntry::Console);
+        self.entries[2] = Some(FdEntry::Console);
+    }
+
     pub fn open_file(&mut self, node: NodeId) -> Result<u32, FdError> {
         for fd in 3..MAX_FDS {
             if self.entries[fd].is_none() {
