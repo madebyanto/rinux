@@ -1,6 +1,8 @@
 use super::context::{self, Context, KERNEL_STACK_SIZE};
 use super::pid::Pid;
-use super::signal::{default_action, DefaultAction, SigAction, SigSet, Signal, NSIG};
+use super::signal::{
+    default_action, signal_wait_status, DefaultAction, SigAction, SigSet, Siginfo, Signal, NSIG,
+};
 use super::wait::WaitTarget;
 use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::fs::fd::FdTable;
@@ -26,12 +28,16 @@ pub enum ProcessError {
 /// Per-process signal state.
 ///
 /// Rinux supports the standard signals only, so the state is one pending bit
-/// per signal and one disposition per signal. `interrupted` records that a
-/// blocking syscall was woken by a signal, so the syscall layer can turn that
-/// wakeup into `EINTR`.
+/// and one captured `siginfo_t` per signal, plus one disposition per signal.
+/// `interrupted` records that a blocking syscall was woken by a signal, so the
+/// syscall layer can turn that wakeup into `EINTR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalState {
     pub pending: SigSet,
+    /// `siginfo_t` captured when each signal was queued. Standard signals are
+    /// not queued more than once, so one slot per signal is enough; stale
+    /// entries are harmless because `pending` decides what is deliverable.
+    pub pending_info: [Siginfo; NSIG],
     pub blocked: SigSet,
     pub actions: [SigAction; NSIG],
     /// Handler nesting, incremented on delivery and decremented by
@@ -45,6 +51,7 @@ impl SignalState {
     pub const fn new() -> Self {
         Self {
             pending: SigSet::EMPTY,
+            pending_info: [Siginfo::EMPTY; NSIG],
             blocked: SigSet::EMPTY,
             actions: [SigAction::DEFAULT; NSIG],
             depth: 0,
@@ -57,6 +64,7 @@ impl SignalState {
     pub fn forked(parent: &Self) -> Self {
         Self {
             pending: SigSet::EMPTY,
+            pending_info: [Siginfo::EMPTY; NSIG],
             blocked: parent.blocked,
             actions: parent.actions,
             depth: 0,
@@ -106,10 +114,13 @@ pub enum ExitStatus {
 
 impl ExitStatus {
     /// Encodes the status word `waitpid(2)` writes.
+    ///
+    /// Signal deaths use the POSIX low byte: `WTERMSIG` is `status & 0x7f` and
+    /// `WCOREDUMP` is bit 7.
     pub const fn wait_status(self) -> i32 {
         match self {
             Self::Exited(code) => (code & 0xFF) << 8,
-            Self::Signaled(signal) => signal.number() as i32,
+            Self::Signaled(signal) => signal_wait_status(signal),
         }
     }
 }

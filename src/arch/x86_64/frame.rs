@@ -105,7 +105,6 @@ impl UserContext {
 
     /// Captures the ring-3 state an IDT stub saved, ignoring `vector` and
     /// `error_code`.
-    #[allow(dead_code)] // used once interrupts deliver signals on `iretq`
     pub fn from_trap_frame(frame: &TrapFrame) -> Self {
         Self {
             r15: frame.r15,
@@ -133,7 +132,6 @@ impl UserContext {
 
     /// Writes the context back into a trap frame, leaving `vector` and
     /// `error_code` untouched.
-    #[allow(dead_code)] // used once interrupts deliver signals on `iretq`
     pub fn write_to_trap_frame(self, frame: &mut TrapFrame) {
         frame.r15 = self.r15;
         frame.r14 = self.r14;

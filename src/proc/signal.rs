@@ -283,6 +283,52 @@ pub const fn default_action(signal: Signal) -> DefaultAction {
     }
 }
 
+/// Synchronous CPU faults that the architecture layer turns into signals.
+///
+/// Kept architecture-neutral so the mapping can be unit-tested on the host;
+/// `idt.rs` translates x86 vectors into these variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareFault {
+    DivideError,
+    Debug,
+    Breakpoint,
+    InvalidOpcode,
+    AlignmentCheck,
+    /// Page fault: `present` is the x86 P bit and `address` is CR2.
+    PageFault { present: bool, address: u64 },
+}
+
+/// POSIX signal and `siginfo_t` for a synchronous hardware fault.
+///
+/// `instruction` is the interrupted RIP, used as `si_addr` for faults that do
+/// not report a memory address.
+pub fn hardware_fault_signal(fault: HardwareFault, instruction: u64) -> (Signal, Siginfo) {
+    let (signal, code, addr) = match fault {
+        HardwareFault::DivideError => (Signal::FPE, FPE_INTDIV, 0),
+        HardwareFault::Debug => (Signal::TRAP, TRAP_TRACE, instruction),
+        HardwareFault::Breakpoint => (Signal::TRAP, TRAP_BRKPT, instruction),
+        HardwareFault::InvalidOpcode => (Signal::ILL, ILL_ILLOPC, instruction),
+        HardwareFault::AlignmentCheck => (Signal::BUS, BUS_ADRALN, 0),
+        HardwareFault::PageFault { present, address } => (
+            Signal::SEGV,
+            if present { SEGV_ACCERR } else { SEGV_MAPERR },
+            address,
+        ),
+    };
+    (signal, Siginfo::kernel(signal, code, addr))
+}
+
+/// Wait-status word for a child that `signal` terminated.
+///
+/// The low seven bits are the signal number; bit 7 is the core-dump flag,
+/// which mirrors the signal's default disposition (`TerminateCore`). User
+/// handlers run before this is reached, so a caught signal never reports a
+/// core dump just because its default action would have produced one.
+pub const fn signal_wait_status(signal: Signal) -> i32 {
+    let core = matches!(default_action(signal), DefaultAction::TerminateCore);
+    signal.number() as i32 | if core { 0x80 } else { 0 }
+}
+
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 
@@ -460,11 +506,25 @@ pub const SI_QUEUE: i32 = -1;
 pub const SI_TKILL: i32 = -6;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
+pub const FPE_INTDIV: i32 = 1;
+pub const TRAP_BRKPT: i32 = 1;
+pub const TRAP_TRACE: i32 = 2;
+pub const ILL_ILLOPC: i32 = 2;
+pub const BUS_ADRALN: i32 = 1;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 pub const CLD_DUMPED: i32 = 3;
 
 impl Siginfo {
+    /// Zeroed info, used as the slot value for signals that are not pending.
+    pub const EMPTY: Self = Self {
+        signo: 0,
+        errno: 0,
+        code: 0,
+        _pad: 0,
+        addr: 0,
+    };
+
     const fn new(signal: Signal, code: i32, addr: u64) -> Self {
         Self {
             signo: signal.number() as i32,

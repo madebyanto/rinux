@@ -202,11 +202,17 @@ impl Scheduler {
         Ok(())
     }
 
-    fn queue_signal(&mut self, target: Pid, signal: Signal) -> Result<(), SignalError> {
+    fn queue_signal(
+        &mut self,
+        target: Pid,
+        signal: Signal,
+        info: Siginfo,
+    ) -> Result<(), SignalError> {
         let process = self
             .process_mut(target)
             .ok_or(SignalError::NoSuchProcess)?;
         process.signals.pending.insert(signal);
+        process.signals.pending_info[signal.index()] = info;
         let wake =
             process.state == ProcessState::Blocked && process.signals.needs_delivery(signal);
         if wake {
@@ -474,7 +480,22 @@ pub fn send_signal(target: Pid, signal: Signal) -> Result<(), SignalError> {
         let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
         let sender = scheduler.current.ok_or(SignalError::NoCurrentProcess)?;
         scheduler.can_signal(sender, target)?;
-        scheduler.queue_signal(target, signal)
+        scheduler.queue_signal(target, signal, Siginfo::user(signal))
+    })
+}
+
+/// Queues a kernel-generated signal for the running process.
+///
+/// Hardware exceptions use this from the IDT path, where the "sender" is the
+/// kernel itself and the current task may not be able to signal itself through
+/// the usual permission checks. The signal is dequeued by
+/// [`deliver_pending_signals`] on the way back to ring 3.
+pub fn raise_current_signal(signal: Signal, info: Siginfo) -> Result<(), SignalError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
+        let pid = scheduler.current.ok_or(SignalError::NoCurrentProcess)?;
+        scheduler.queue_signal(pid, signal, info)
     })
 }
 
@@ -502,7 +523,7 @@ pub fn send_signal_all(signal: Option<Signal>) -> Result<(), SignalError> {
         if let Some(signal) = signal {
             for target in targets.iter().take(count).flatten() {
                 if scheduler.can_signal(sender, *target).is_ok() {
-                    let _ = scheduler.queue_signal(*target, signal);
+                    let _ = scheduler.queue_signal(*target, signal, Siginfo::user(signal));
                 }
             }
         }
@@ -633,6 +654,7 @@ pub fn reset_signals_for_exec() -> Result<(), SignalError> {
             }
         }
         signals.pending = SigSet::EMPTY;
+        signals.pending_info.fill(Siginfo::EMPTY);
         signals.depth = 0;
         signals.interrupted = false;
         Ok(())
@@ -649,6 +671,7 @@ struct HandlerPlan {
     signal: Signal,
     action: SigAction,
     blocked: SigSet,
+    info: Siginfo,
 }
 
 enum DeliveryPlan {
@@ -680,15 +703,16 @@ fn plan_delivery() -> Option<DeliveryPlan> {
             signal,
             action,
             blocked: signals.blocked,
+            info: signals.pending_info[signal.index()],
         }))
     })
 }
 
 /// Delivers at most one pending signal as the task leaves kernel space.
 ///
-/// Called from the `sysretq` path with the interrupted ring-3 context. A
-/// handler starts before the task resumes the interrupted instruction; a fatal
-/// default action ends the task instead of returning.
+/// Called from both the `sysretq` and `iretq` exits with the interrupted ring-3
+/// context. A handler starts before the task resumes the interrupted
+/// instruction; a fatal default action ends the task instead of returning.
 pub fn deliver_pending_signals(context: &mut UserContext) {
     match plan_delivery() {
         None => {}
@@ -751,7 +775,7 @@ fn deliver_handler(context: &mut UserContext, plan: HandlerPlan) {
         context.to_sig_context(),
         plan.blocked,
         plan.signal,
-        Siginfo::user(plan.signal),
+        plan.info,
     );
     // Store the frame without the scheduler lock; see [`HandlerPlan`].
     unsafe { frame.write_to(frame_address) };

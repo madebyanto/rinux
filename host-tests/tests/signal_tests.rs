@@ -1,12 +1,14 @@
 use core::mem::{offset_of, size_of};
 
 use hosttest::signal::{
-    default_action, frame_fits, handler_mask, locate_frame, next_deliverable, next_interrupting,
-    place_frame, sanitize_rflags, DefaultAction, SigAction, SigContext, SigSet, Siginfo, Signal,
-    SignalFrame, StackRange, CLD_EXITED, CLD_KILLED, FRAME_RED_ZONE, FRAME_STACK_MARGIN, NSIG,
-    SA_NODEFER, SA_ONSTACK, SA_RESTART, SA_RESETHAND, SA_RESTORER, SA_SIGINFO, SEGV_MAPERR,
-    SIG_DFL, SIG_IGN, SIGNAL_FRAME_CONTEXT_OFFSET, SIGNAL_FRAME_INFO_OFFSET, SIGNAL_FRAME_MAGIC,
-    SIGNAL_FRAME_SIZE, SI_USER, TRAMPOLINE_CODE, USER_RFLAGS_MASK, VALID_SIGNAL_BITS,
+    default_action, frame_fits, handler_mask, hardware_fault_signal, locate_frame, next_deliverable,
+    next_interrupting, place_frame, sanitize_rflags, signal_wait_status, DefaultAction,
+    HardwareFault, SigAction, SigContext, SigSet, Siginfo, Signal, SignalFrame, StackRange,
+    BUS_ADRALN, CLD_EXITED, CLD_KILLED, FPE_INTDIV, FRAME_RED_ZONE, FRAME_STACK_MARGIN,
+    ILL_ILLOPC, NSIG, SA_NODEFER, SA_ONSTACK, SA_RESTART, SA_RESETHAND, SA_RESTORER, SA_SIGINFO,
+    SEGV_ACCERR, SEGV_MAPERR, SIG_DFL, SIG_IGN, SIGNAL_FRAME_CONTEXT_OFFSET,
+    SIGNAL_FRAME_INFO_OFFSET, SIGNAL_FRAME_MAGIC, SIGNAL_FRAME_SIZE, SI_USER, TRAMPOLINE_CODE,
+    TRAP_BRKPT, TRAP_TRACE, USER_RFLAGS_MASK, VALID_SIGNAL_BITS,
 };
 use hosttest::uaccess::{
     trampoline_valid, PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, TRAMPOLINE_BASE, TRAMPOLINE_END,
@@ -353,6 +355,87 @@ fn siginfo_constructors_encode_the_payload() {
     let killed = Siginfo::child(7, CLD_KILLED, 9);
     assert_eq!(killed.child_pid(), 7);
     assert_eq!(killed.child_status(), 9);
+
+    assert_eq!(Siginfo::EMPTY.signo, 0);
+    assert_eq!(Siginfo::EMPTY.code, 0);
+    assert_eq!(Siginfo::EMPTY.addr, 0);
+}
+
+#[test]
+fn hardware_faults_map_to_posix_signals_and_si_codes() {
+    let (signal, info) = hardware_fault_signal(HardwareFault::DivideError, 0x1000);
+    assert_eq!(signal, Signal::FPE);
+    assert_eq!(info.signo, 8);
+    assert_eq!(info.code, FPE_INTDIV);
+    assert_eq!(info.addr, 0);
+
+    let (signal, info) = hardware_fault_signal(HardwareFault::Debug, 0x2000);
+    assert_eq!(signal, Signal::TRAP);
+    assert_eq!(info.code, TRAP_TRACE);
+    assert_eq!(info.addr, 0x2000);
+
+    let (signal, info) = hardware_fault_signal(HardwareFault::Breakpoint, 0x3000);
+    assert_eq!(signal, Signal::TRAP);
+    assert_eq!(info.code, TRAP_BRKPT);
+    assert_eq!(info.addr, 0x3000);
+
+    let (signal, info) = hardware_fault_signal(HardwareFault::InvalidOpcode, 0x4000);
+    assert_eq!(signal, Signal::ILL);
+    assert_eq!(info.code, ILL_ILLOPC);
+    assert_eq!(info.addr, 0x4000);
+
+    let (signal, info) = hardware_fault_signal(HardwareFault::AlignmentCheck, 0x5000);
+    assert_eq!(signal, Signal::BUS);
+    assert_eq!(info.code, BUS_ADRALN);
+    assert_eq!(info.addr, 0);
+
+    let (signal, info) = hardware_fault_signal(
+        HardwareFault::PageFault {
+            present: false,
+            address: 0xDEAD_0000,
+        },
+        0x6000,
+    );
+    assert_eq!(signal, Signal::SEGV);
+    assert_eq!(info.signo, 11);
+    assert_eq!(info.code, SEGV_MAPERR);
+    assert_eq!(info.addr, 0xDEAD_0000);
+
+    let (signal, info) = hardware_fault_signal(
+        HardwareFault::PageFault {
+            present: true,
+            address: 0xBEEF_0000,
+        },
+        0x7000,
+    );
+    assert_eq!(signal, Signal::SEGV);
+    assert_eq!(info.code, SEGV_ACCERR);
+    assert_eq!(info.addr, 0xBEEF_0000);
+}
+
+#[test]
+fn wait_status_encodes_termination_signal_and_core_flag() {
+    // Normal exits keep the low byte clear.
+    assert_eq!(signal_wait_status(Signal::TERM), 15);
+    // Signals whose default action terminates without a core dump.
+    for signal in [Signal::HUP, Signal::INT, Signal::KILL, Signal::PIPE] {
+        assert_eq!(signal_wait_status(signal), signal.number() as i32);
+    }
+    // TerminateCore signals set bit 7 (WCOREDUMP).
+    for signal in [
+        Signal::QUIT,
+        Signal::ILL,
+        Signal::TRAP,
+        Signal::ABRT,
+        Signal::BUS,
+        Signal::FPE,
+        Signal::SEGV,
+    ] {
+        assert_eq!(
+            signal_wait_status(signal),
+            signal.number() as i32 | 0x80
+        );
+    }
 }
 
 #[test]

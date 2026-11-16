@@ -1,7 +1,9 @@
 use super::cpu;
+use super::frame::UserContext;
 use super::pic;
 use crate::mm::fault::PageFaultError;
 use crate::proc::scheduler;
+use crate::proc::signal::{self, HardwareFault, Siginfo, Signal};
 use crate::sync::SpinLock;
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -17,7 +19,13 @@ const STUB_TABLE_LEN: usize = STUB_COUNT + 1;
 const IDT_ENTRY_COUNT: usize = 256;
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
 const INTERRUPT_GATE: u8 = 0x8E;
+const DIVIDE_ERROR: u64 = 0;
+const DEBUG: u64 = 1;
+const BREAKPOINT: u64 = 3;
+const INVALID_OPCODE: u64 = 6;
 const PAGE_FAULT: u64 = 14;
+const ALIGNMENT_CHECK: u64 = 17;
+const RING3: u64 = 3;
 
 extern "C" {
     #[link_name = "isr_stub_table"]
@@ -199,6 +207,22 @@ pub fn register_irq(irq: u8, handler: IrqHandler) -> Result<(), IrqError> {
 #[no_mangle]
 pub extern "C" fn interrupt_dispatch(frame: *mut TrapFrame) {
     let frame = unsafe { &mut *frame };
+    if frame.cs & RING3 == RING3 {
+        handle_user_trap(frame);
+    } else {
+        handle_kernel_trap(frame);
+    }
+    // Signals are delivered on the way out to ring 3, matching the syscall
+    // return path. Kernel returns (including a syscall that resolved a COW
+    // fault) deliver at `syscall_dispatch` instead.
+    deliver_pending(frame);
+}
+
+/// Trap handling for a ring-0 (kernel) interrupted context.
+///
+/// Kernel bugs stay fatal: print the register dump and halt instead of trying
+/// to turn them into user signals.
+fn handle_kernel_trap(frame: &TrapFrame) {
     match frame.vector {
         0..=31 => {
             if frame.vector == PAGE_FAULT && try_resolve_page_fault(frame) {
@@ -209,6 +233,63 @@ pub extern "C" fn interrupt_dispatch(frame: *mut TrapFrame) {
         32..=47 => handle_irq((frame.vector - pic::VECTOR_BASE as u64) as u8),
         _ => handle_unexpected(frame),
     }
+}
+
+/// Trap handling for a ring-3 context.
+///
+/// CPU exceptions become POSIX signals for the current process; IRQs keep
+/// their normal handlers and deliver pending signals on the way out.
+fn handle_user_trap(frame: &TrapFrame) {
+    match frame.vector {
+        0..=31 => handle_user_exception(frame),
+        32..=47 => handle_irq((frame.vector - pic::VECTOR_BASE as u64) as u8),
+        _ => handle_unexpected(frame),
+    }
+}
+
+/// Translates a ring-3 CPU exception into a queued Unix signal.
+///
+/// Unsupported exceptions keep the fatal kernel dump; COW write faults are
+/// resolved first and simply retry the faulting instruction.
+fn handle_user_exception(frame: &TrapFrame) {
+    if frame.vector == PAGE_FAULT && try_resolve_page_fault(frame) {
+        return;
+    }
+    let Some((signal, info)) = user_fault_signal(frame) else {
+        handle_exception(frame);
+    };
+    if scheduler::raise_current_signal(signal, info).is_err() {
+        handle_exception(frame);
+    }
+}
+
+/// Maps a hardware exception to its POSIX signal and `siginfo_t`.
+fn user_fault_signal(frame: &TrapFrame) -> Option<(Signal, Siginfo)> {
+    let fault = match frame.vector {
+        DIVIDE_ERROR => HardwareFault::DivideError,
+        DEBUG => HardwareFault::Debug,
+        BREAKPOINT => HardwareFault::Breakpoint,
+        INVALID_OPCODE => HardwareFault::InvalidOpcode,
+        ALIGNMENT_CHECK => HardwareFault::AlignmentCheck,
+        PAGE_FAULT => HardwareFault::PageFault {
+            // A missing translation is MAPERR; a present page that rejects
+            // the access (protection, reserved bits, NX) is ACCERR.
+            present: PageFaultError::new(frame.error_code).present(),
+            address: cpu::read_cr2(),
+        },
+        _ => return None,
+    };
+    Some(signal::hardware_fault_signal(fault, frame.rip))
+}
+
+/// Delivers at most one pending signal to a ring-3 trap frame.
+fn deliver_pending(frame: &mut TrapFrame) {
+    if frame.cs & RING3 != RING3 {
+        return;
+    }
+    let mut context = UserContext::from_trap_frame(frame);
+    scheduler::deliver_pending_signals(&mut context);
+    context.write_to_trap_frame(frame);
 }
 
 /// Handles a COW write fault before the fatal exception path runs.
