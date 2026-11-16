@@ -3,10 +3,14 @@ use super::pid::{Pid, PidAllocator, INIT_PID};
 use super::process::{ExitStatus, Process, ProcessState, SignalState, TaskEntry};
 use super::queue::{ReadyQueue, MAX_PROCESSES};
 use super::reap::ReapList;
-use super::signal::{SigAction, SigSet, Signal};
+use super::signal::{
+    self, handler_mask, DefaultAction, SigAction, SigSet, Siginfo, Signal, SignalFrame, StackRange,
+    MAX_SIGNAL_DEPTH, SIGNAL_FRAME_CONTEXT_OFFSET, SIGNAL_FRAME_INFO_OFFSET,
+};
 use super::wait::WaitTarget;
 use super::wait_queue::{PidQueue, QueueError};
 use crate::arch::x86_64::cpu;
+use crate::arch::x86_64::frame::UserContext;
 use crate::arch::x86_64::gdt;
 use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::fs::fd::{FdEntry, FdError, FdTable};
@@ -635,6 +639,175 @@ pub fn reset_signals_for_exec() -> Result<(), SignalError> {
     })
 }
 
+/// A signal selected for delivery, with the state needed to commit it.
+///
+/// The plan is computed under the scheduler lock but carried outside it: the
+/// frame store below can take a copy-on-write fault, whose handler re-enters
+/// the scheduler.
+struct HandlerPlan {
+    pid: Pid,
+    signal: Signal,
+    action: SigAction,
+    blocked: SigSet,
+}
+
+enum DeliveryPlan {
+    /// A real handler; the task resumes in ring 3 at `action.handler`.
+    Handler(HandlerPlan),
+    /// No handler (or nesting exhausted): apply the signal's default action.
+    Fatal(Signal),
+}
+
+/// Chooses the next signal to deliver to the running task.
+fn plan_delivery() -> Option<DeliveryPlan> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut()?;
+        let pid = scheduler.current?;
+        let process = scheduler.process_mut(pid)?;
+        let signals = &mut process.signals;
+        let signal = signal::next_deliverable(
+            &mut signals.pending,
+            signals.blocked,
+            &signals.actions,
+        )?;
+        let action = signals.actions[signal.index()];
+        if !action.is_caught() || signals.depth >= MAX_SIGNAL_DEPTH {
+            return Some(DeliveryPlan::Fatal(signal));
+        }
+        Some(DeliveryPlan::Handler(HandlerPlan {
+            pid,
+            signal,
+            action,
+            blocked: signals.blocked,
+        }))
+    })
+}
+
+/// Delivers at most one pending signal as the task leaves kernel space.
+///
+/// Called from the `sysretq` path with the interrupted ring-3 context. A
+/// handler starts before the task resumes the interrupted instruction; a fatal
+/// default action ends the task instead of returning.
+pub fn deliver_pending_signals(context: &mut UserContext) {
+    match plan_delivery() {
+        None => {}
+        Some(DeliveryPlan::Fatal(signal)) => apply_default_action(signal),
+        Some(DeliveryPlan::Handler(plan)) => deliver_handler(context, plan),
+    }
+}
+
+/// Applies a signal's default disposition.
+///
+/// Rinux has no job control yet, so `Stop` behaves like `Ignore`; both discard
+/// the signal. Terminating actions leave a `Signaled` zombie for `waitpid`.
+fn apply_default_action(signal: Signal) {
+    match signal::default_action(signal) {
+        DefaultAction::Ignore | DefaultAction::Stop => discard_pending(signal),
+        DefaultAction::Terminate | DefaultAction::TerminateCore => {
+            exit_current_status(ExitStatus::Signaled(signal))
+        }
+    }
+}
+
+/// Drops a pending signal that needs no handler frame.
+fn discard_pending(signal: Signal) {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return;
+        };
+        let Some(pid) = scheduler.current else {
+            return;
+        };
+        if let Some(process) = scheduler.process_mut(pid) {
+            process.signals.pending.remove(signal);
+        }
+    });
+}
+
+fn deliver_handler(context: &mut UserContext, plan: HandlerPlan) {
+    let stack = StackRange {
+        base: uaccess::STACK_BASE as u64,
+        top: uaccess::STACK_TOP as u64,
+    };
+    // The frame goes below the interrupted stack pointer, clear of the SysV
+    // red zone, with the handler entered as `rsp % 16 == 8`.
+    let frame_address = match signal::place_frame(context.rsp, stack) {
+        Some(address) => address,
+        None => {
+            // No room for a handler frame: the signal's default action applies.
+            apply_default_action(plan.signal);
+            return;
+        }
+    };
+    let restorer = if plan.action.uses_restorer() {
+        plan.action.restorer
+    } else {
+        uaccess::TRAMPOLINE_BASE as u64
+    };
+    let frame = SignalFrame::new(
+        restorer,
+        context.to_sig_context(),
+        plan.blocked,
+        plan.signal,
+        Siginfo::user(plan.signal),
+    );
+    // Store the frame without the scheduler lock; see [`HandlerPlan`].
+    unsafe { frame.write_to(frame_address) };
+    context.rip = plan.action.handler;
+    context.rsp = frame_address;
+    context.rdi = plan.signal.number() as u64;
+    context.rsi = frame_address + SIGNAL_FRAME_INFO_OFFSET as u64;
+    context.rdx = frame_address + SIGNAL_FRAME_CONTEXT_OFFSET as u64;
+    context.rax = 0;
+    context.rflags = signal::sanitize_rflags(context.rflags);
+    commit_delivery(&plan);
+}
+
+/// Marks the delivery complete: dequeue the signal, block it while its handler
+/// runs, and count the nesting level.
+fn commit_delivery(plan: &HandlerPlan) {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return;
+        };
+        if scheduler.current != Some(plan.pid) {
+            return;
+        }
+        let Some(process) = scheduler.process_mut(plan.pid) else {
+            return;
+        };
+        let signals = &mut process.signals;
+        signals.pending.remove(plan.signal);
+        signals.depth = signals.depth.saturating_add(1);
+        signals.blocked = handler_mask(plan.blocked, plan.action, plan.signal);
+        if plan.action.resets_on_entry() {
+            signals.actions[plan.signal.index()] = SigAction::DEFAULT;
+        }
+    });
+}
+
+/// Completes `rt_sigreturn`: restores the saved blocked mask and leaves the
+/// handler.
+pub fn finish_sigreturn(saved_mask: SigSet) -> Result<(), SignalError> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut().ok_or(SignalError::NotInitialized)?;
+        let pid = scheduler
+            .current
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let process = scheduler
+            .process_mut(pid)
+            .ok_or(SignalError::NoCurrentProcess)?;
+        let signals = &mut process.signals;
+        signals.blocked = saved_mask.without_uncatchable();
+        signals.depth = signals.depth.saturating_sub(1);
+        Ok(())
+    })
+}
+
 pub fn task_count() -> usize {
     cpu::without_interrupts(|| {
         let guard = SCHEDULER.lock();
@@ -940,6 +1113,16 @@ pub fn wake_keyboard_waiter() {
 }
 
 pub fn exit_current(code: i32) -> ! {
+    exit_current_status(ExitStatus::Exited(code))
+}
+
+/// Terminates the running task because of an uncaught signal.
+pub fn exit_current_signaled(signal: Signal) -> ! {
+    exit_current_status(ExitStatus::Signaled(signal))
+}
+
+/// Shared teardown for a normal exit and a fatal signal.
+fn exit_current_status(status: ExitStatus) -> ! {
     cpu::disable_interrupts();
     // Descriptors are closed as part of exiting, not when the zombie is
     // reaped: a blocked reader must observe end-of-file as soon as the last
@@ -963,7 +1146,7 @@ pub fn exit_current(code: i32) -> ! {
                 let parent = match scheduler.process_mut(pid) {
                     Some(process) => {
                         process.state = ProcessState::Zombie;
-                        process.exit_status = Some(ExitStatus::Exited(code));
+                        process.exit_status = Some(status);
                         orphaned_fds = Some(core::mem::replace(
                             &mut process.fds,
                             FdTable::empty(),
@@ -1006,7 +1189,12 @@ pub fn exit_current(code: i32) -> ! {
     // Pipe endpoints (and any other owned descriptors) are released here,
     // where waking blocked peers cannot re-enter a held scheduler lock.
     drop(orphaned_fds);
-    crate::kprintln!("process exited with code {}", code);
+    match status {
+        ExitStatus::Exited(code) => crate::kprintln!("process exited with code {}", code),
+        ExitStatus::Signaled(signal) => {
+            crate::kprintln!("process terminated by {}", signal.name())
+        }
+    }
     schedule();
     cpu::halt_forever()
 }

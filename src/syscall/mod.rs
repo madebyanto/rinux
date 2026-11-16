@@ -1,6 +1,8 @@
 pub mod abi;
 
 use crate::arch::x86_64::cpu;
+use crate::arch::x86_64::frame::UserContext;
+use crate::arch::x86_64::gdt;
 use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::console;
 use crate::drivers::ps2;
@@ -13,7 +15,9 @@ use crate::fs::pipe::{self, PipeDirection};
 use crate::fs::vfs::{FileType, VfsError};
 use crate::mm::uaccess;
 use crate::proc::scheduler::{self, ForkError, SchedulerError, SignalError, WaitResult};
-use crate::proc::signal::{SigAction, SigSet, Signal};
+use crate::proc::signal::{
+    self, SigAction, SigSet, Signal, SignalFrame, StackRange,
+};
 use crate::proc::wait::WaitTarget;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -37,6 +41,19 @@ const _: () = assert!(size_of::<UserStat>() == 24);
 #[no_mangle]
 pub extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
+    let result = dispatch(frame);
+    // The assembly stub stores this into the saved `rax`, so publish the
+    // syscall result before a signal handler may overwrite it.
+    frame.rax = result;
+    // Signals are delivered on the way out to ring 3, exactly where Linux
+    // checks `TIF_SIGPENDING`: before the interrupted instruction resumes.
+    let mut context = UserContext::from_syscall_frame(frame);
+    scheduler::deliver_pending_signals(&mut context);
+    context.write_to_syscall_frame(frame);
+    frame.rax
+}
+
+fn dispatch(frame: &mut SyscallFrame) -> u64 {
     let number = frame.rax;
     let arg0 = frame.rdi;
     let arg1 = frame.rsi;
@@ -50,6 +67,7 @@ pub extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         Some(abi::Syscall::Lseek) => sys_lseek(arg0, arg1, arg2),
         Some(abi::Syscall::RtSigaction) => sys_sigaction(frame, arg0, arg1, arg2),
         Some(abi::Syscall::RtSigprocmask) => sys_sigprocmask(frame, arg0, arg1, arg2),
+        Some(abi::Syscall::RtSigreturn) => sys_sigreturn(frame),
         Some(abi::Syscall::Pipe) => sys_pipe(arg0),
         Some(abi::Syscall::GetPid) => sys_getpid(),
         Some(abi::Syscall::Fork) => sys_fork(frame),
@@ -520,6 +538,57 @@ fn sys_sigprocmask(frame: &SyscallFrame, how: u64, set: u64, oldset: u64) -> u64
         unsafe { core::ptr::write_unaligned(oldset as *mut u64, previous.bits()) };
     }
     0
+}
+
+/// `rt_sigreturn`: restores the context saved by the last delivery.
+///
+/// The trampoline runs one word into the frame (`rsp == frame + 8`), so
+/// [`signal::locate_frame`] walks back to the base. Everything read here is
+/// user-writable, so the magic, stack range, selectors and resume addresses
+/// are all revalidated before any register is trusted.
+fn sys_sigreturn(frame: &mut SyscallFrame) -> u64 {
+    let Some(signal_frame) = read_signal_frame(frame.user_rsp) else {
+        // Linux turns a corrupt `rt_sigreturn` into SIGSEGV; Rinux has no
+        // recoverable kernel frame to return to, so terminate instead.
+        scheduler::exit_current_signaled(Signal::SEGV);
+    };
+    let saved = signal_frame.context;
+    if saved.cs != gdt::USER_CODE_RPL3 as u64
+        || saved.ss != gdt::USER_DATA_RPL3 as u64
+        || !user_executable(saved.rip)
+        || !uaccess::stack_valid(saved.rsp as usize, 0)
+    {
+        scheduler::exit_current_signaled(Signal::SEGV);
+    }
+    if scheduler::finish_sigreturn(SigSet::from_bits(signal_frame.saved_mask)).is_err() {
+        scheduler::exit_current_signaled(Signal::SEGV);
+    }
+    let mut context = UserContext::from_sig_context(saved);
+    context.rflags = signal::sanitize_rflags(saved.rflags);
+    context.write_to_syscall_frame(frame);
+    // Returning `rax` here makes `syscall.S` store the restored value, not a
+    // syscall return code, into the interrupted register.
+    context.rax
+}
+
+/// Validates and copies the frame the trampoline pointed at.
+fn read_signal_frame(user_rsp: u64) -> Option<SignalFrame> {
+    let stack = StackRange {
+        base: uaccess::STACK_BASE as u64,
+        top: uaccess::STACK_TOP as u64,
+    };
+    let address = signal::locate_frame(user_rsp, stack)?;
+    let frame = unsafe { SignalFrame::read_from(address) };
+    if frame.signal().is_none() {
+        return None;
+    }
+    Some(frame)
+}
+
+/// Whether `rip` may be resumed: the program window or the trampoline page.
+fn user_executable(address: u64) -> bool {
+    let address = address as usize;
+    uaccess::program_valid(address, 1) || uaccess::trampoline_valid(address, 1)
 }
 
 fn user_path(pointer: u64) -> Result<String, u64> {

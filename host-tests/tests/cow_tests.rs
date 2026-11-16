@@ -191,6 +191,35 @@ fn nested_forks_copy_the_page_once_per_writer() {
 }
 
 #[test]
+fn read_only_executable_pages_are_shared_across_fork() {
+    let _serial = hosttest::lock_page_table_tests();
+    hosttest::init_frames();
+    hosttest::paging::init_kernel_root();
+
+    // The sigreturn trampoline is mapped `USER` only: read-only, executable,
+    // and therefore cloned by reference instead of becoming copy-on-write.
+    let mut parent = AddressSpace::new().expect("parent address space");
+    let trampoline = hosttest::allocate_frame().expect("trampoline frame");
+    fill_frame(trampoline, 0x0F);
+    parent
+        .map_user(USER_VIRT, trampoline, USER)
+        .expect("map trampoline");
+
+    let mut child = parent.clone_user().expect("child clone");
+    assert_eq!(hosttest::frame_refcount(trampoline), Ok(2));
+    assert_eq!(
+        hosttest::paging::translate_in(child.root(), USER_VIRT),
+        Some(trampoline)
+    );
+    // A write fault on it is not a COW fault: the page was never writable.
+    assert_eq!(
+        child.handle_cow_fault(USER_VIRT),
+        Err(CowError::Leaf(CowLeafError::NotCow))
+    );
+    assert_eq!(hosttest::frame_refcount(trampoline), Ok(2));
+}
+
+#[test]
 fn resolves_cow_faults_in_place_and_by_copying() {
     let _serial = hosttest::lock_page_table_tests();
     hosttest::init_frames();

@@ -8,6 +8,7 @@ pub const SYS_STAT: u64 = 4;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
+pub const SYS_RT_SIGRETURN: u64 = 15;
 pub const SYS_PIPE: u64 = 22;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_EXECVE: u64 = 59;
@@ -53,6 +54,7 @@ pub enum Syscall {
     Lseek,
     RtSigaction,
     RtSigprocmask,
+    RtSigreturn,
     Pipe,
     GetPid,
     Fork,
@@ -72,6 +74,7 @@ pub fn classify(number: u64) -> Option<Syscall> {
         SYS_LSEEK => Some(Syscall::Lseek),
         SYS_RT_SIGACTION => Some(Syscall::RtSigaction),
         SYS_RT_SIGPROCMASK => Some(Syscall::RtSigprocmask),
+        SYS_RT_SIGRETURN => Some(Syscall::RtSigreturn),
         SYS_PIPE => Some(Syscall::Pipe),
         SYS_GETPID => Some(Syscall::GetPid),
         SYS_FORK => Some(Syscall::Fork),

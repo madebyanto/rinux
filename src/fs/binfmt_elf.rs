@@ -10,14 +10,18 @@ use crate::fs::vfs::VfsError;
 use crate::mm;
 use crate::mm::address_space::AddressSpace;
 use crate::mm::uaccess::{
-    PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, STACK_PAGES, STACK_SIZE, STACK_TOP,
+    PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, STACK_PAGES, STACK_SIZE, STACK_TOP, TRAMPOLINE_BASE,
+    TRAMPOLINE_SIZE,
 };
+use crate::proc::signal::TRAMPOLINE_CODE;
 use crate::syscall::abi;
 use alloc::vec::Vec;
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 const MAX_ELF_FILE: usize = 256 * 1024;
 const PAGE_SIZE: usize = 4096;
+const _: () = assert!(TRAMPOLINE_SIZE == PAGE_SIZE);
+const _: () = assert!(TRAMPOLINE_CODE.len() <= TRAMPOLINE_SIZE);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadError {
@@ -208,6 +212,8 @@ pub fn build_image(
         }
     }
 
+    map_trampoline(&mut address_space)?;
+
     let mut stack_frames = Vec::new();
     stack_frames
         .try_reserve_exact(STACK_PAGES)
@@ -253,6 +259,31 @@ pub fn build_image(
         stack_top: stack_pointer,
         address_space,
     })
+}
+
+/// Maps the kernel-provided sigreturn trampoline into a fresh address space.
+///
+/// The page is user-accessible, read-only and executable: no `WRITABLE`, no
+/// `NO_EXECUTE`. Because every user root is rebuilt here, `execve` always gets
+/// a private copy while `fork` shares it through the read-only clone path.
+fn map_trampoline(address_space: &mut AddressSpace) -> Result<(), LoadError> {
+    let phys = mm::allocate_frame().ok_or(LoadError::OutOfMemory)?;
+    unsafe {
+        write_bytes(phys as *mut u8, 0, PAGE_SIZE);
+        copy_nonoverlapping(
+            TRAMPOLINE_CODE.as_ptr(),
+            phys as *mut u8,
+            TRAMPOLINE_CODE.len(),
+        );
+    }
+    if address_space
+        .map_user(TRAMPOLINE_BASE, phys, crate::mm::paging::USER)
+        .is_err()
+    {
+        let _ = mm::release_frame(phys);
+        return Err(LoadError::MapFailed);
+    }
+    Ok(())
 }
 
 /// Runs stages 1-4 for an already resolved path.

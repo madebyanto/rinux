@@ -4,7 +4,7 @@ use hosttest::syscall_abi::{
     classify, errno, KernelSigAction, Syscall, E2BIG, EBADF, ECHILD, EFAULT, EINTR, EINVAL,
     ENOMEM, ENOSYS, ENOENT, EPERM, EROFS, ESRCH, SIGSET_SIZE, SYS_CLOSE, SYS_EXECVE, SYS_EXIT,
     SYS_FORK, SYS_GETPID, SYS_KILL, SYS_LSEEK, SYS_OPEN, SYS_READ, SYS_RT_SIGACTION,
-    SYS_RT_SIGPROCMASK, SYS_STAT, SYS_WAITPID, SYS_WRITE,
+    SYS_RT_SIGPROCMASK, SYS_RT_SIGRETURN, SYS_STAT, SYS_WAITPID, SYS_WRITE,
 };
 
 #[test]
@@ -17,6 +17,7 @@ fn classifies_linux_syscall_numbers() {
     assert_eq!(classify(SYS_LSEEK), Some(Syscall::Lseek));
     assert_eq!(classify(SYS_RT_SIGACTION), Some(Syscall::RtSigaction));
     assert_eq!(classify(SYS_RT_SIGPROCMASK), Some(Syscall::RtSigprocmask));
+    assert_eq!(classify(SYS_RT_SIGRETURN), Some(Syscall::RtSigreturn));
     assert_eq!(classify(SYS_FORK), Some(Syscall::Fork));
     assert_eq!(classify(SYS_EXECVE), Some(Syscall::Execve));
     assert_eq!(classify(SYS_WAITPID), Some(Syscall::WaitPid));
@@ -39,6 +40,7 @@ fn kernel_sigaction_matches_the_linux_abi() {
     assert_eq!(SIGSET_SIZE, 8);
     assert_eq!(SYS_RT_SIGACTION, 13);
     assert_eq!(SYS_RT_SIGPROCMASK, 14);
+    assert_eq!(SYS_RT_SIGRETURN, 15);
     assert_eq!(SYS_KILL, 62);
 }
 

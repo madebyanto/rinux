@@ -5,10 +5,13 @@ use hosttest::signal::{
     place_frame, sanitize_rflags, DefaultAction, SigAction, SigContext, SigSet, Siginfo, Signal,
     SignalFrame, StackRange, CLD_EXITED, CLD_KILLED, FRAME_RED_ZONE, FRAME_STACK_MARGIN, NSIG,
     SA_NODEFER, SA_ONSTACK, SA_RESTART, SA_RESETHAND, SA_RESTORER, SA_SIGINFO, SEGV_MAPERR,
-    SIG_DFL, SIG_IGN, SIGNAL_FRAME_MAGIC, SIGNAL_FRAME_SIZE, SI_USER, TRAMPOLINE_BASE,
-    TRAMPOLINE_CODE, USER_RFLAGS_MASK, VALID_SIGNAL_BITS,
+    SIG_DFL, SIG_IGN, SIGNAL_FRAME_CONTEXT_OFFSET, SIGNAL_FRAME_INFO_OFFSET, SIGNAL_FRAME_MAGIC,
+    SIGNAL_FRAME_SIZE, SI_USER, TRAMPOLINE_CODE, USER_RFLAGS_MASK, VALID_SIGNAL_BITS,
 };
-use hosttest::uaccess::{PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE};
+use hosttest::uaccess::{
+    trampoline_valid, PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, TRAMPOLINE_BASE, TRAMPOLINE_END,
+    TRAMPOLINE_SIZE,
+};
 
 fn set(signals: &[Signal]) -> SigSet {
     let mut result = SigSet::EMPTY;
@@ -381,6 +384,8 @@ fn signal_frame_layout_is_stable() {
     assert_eq!(offset_of!(SignalFrame, signo), 176);
     assert_eq!(offset_of!(SignalFrame, info), 184);
     assert_eq!(offset_of!(SignalFrame, magic), 208);
+    assert_eq!(SIGNAL_FRAME_CONTEXT_OFFSET, 8);
+    assert_eq!(SIGNAL_FRAME_INFO_OFFSET, 184);
 }
 
 #[test]
@@ -398,7 +403,7 @@ fn signal_frame_round_trips_through_memory() {
     let mask = set(&[Signal::INT, Signal::TERM]);
     let info = Siginfo::user(Signal::USR1);
     let frame = SignalFrame::new(
-        TRAMPOLINE_BASE,
+        TRAMPOLINE_BASE as u64,
         context,
         mask,
         Signal::USR1,
@@ -542,8 +547,14 @@ fn trampoline_page_is_well_formed_and_isolated() {
 
     assert_eq!(TRAMPOLINE_BASE % 4096, 0, "page aligned");
     assert_eq!(TRAMPOLINE_BASE >> 39, 1, "user PML4 slot");
+    assert_eq!(TRAMPOLINE_SIZE, 4096);
+    assert_eq!(TRAMPOLINE_END, TRAMPOLINE_BASE + TRAMPOLINE_SIZE);
+    assert!(TRAMPOLINE_SIZE >= TRAMPOLINE_CODE.len());
+    assert!(trampoline_valid(TRAMPOLINE_BASE, TRAMPOLINE_CODE.len()));
+    assert!(!trampoline_valid(TRAMPOLINE_END, 1));
+    assert!(!trampoline_valid(TRAMPOLINE_BASE - 1, 1));
     let program_end = (PROGRAM_BASE + PROGRAM_SIZE) as u64;
-    assert!(TRAMPOLINE_BASE >= program_end);
-    assert!(TRAMPOLINE_BASE + 4096 <= STACK_BASE as u64);
-    assert_ne!(TRAMPOLINE_BASE, PROGRAM_BASE as u64);
+    assert!(TRAMPOLINE_BASE as u64 >= program_end);
+    assert!(TRAMPOLINE_END as u64 <= STACK_BASE as u64);
+    assert_ne!(TRAMPOLINE_BASE, PROGRAM_BASE);
 }

@@ -27,7 +27,10 @@ p1_table:
 .skip 4096
 .align 16
 stack_bottom:
-.skip 262144
+# The boot stack must hold the scheduler's large debug-build temporaries
+# (`Scheduler::new` and friends); 256 KiB overflowed into the page tables
+# directly below it once per-process signal state grew.
+.skip 1048576
 stack_top:
 .global boot_stack_top
 boot_stack_top:

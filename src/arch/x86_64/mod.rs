@@ -1,6 +1,7 @@
 pub mod boot;
 pub mod cpu;
 pub mod descriptor;
+pub mod frame;
 pub mod gdt;
 pub mod idt;
 pub mod multiboot2;

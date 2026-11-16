@@ -22,19 +22,12 @@ pub const VALID_SIGNAL_BITS: u64 = (1u64 << NSIG) - 1;
 /// Signal number encoded by the sigreturn trampoline.
 pub const SIGRETURN_NUMBER: u64 = 15;
 
-/// Address of the kernel-provided sigreturn trampoline page.
-///
-/// Lives in the user PML4 slot, one MiB above the program window and below the
-/// user stack. `binfmt_elf::build_image` maps it read-only/executable in every
-/// user address space; `fork` inherits it through the normal user-mapping
-/// clone.
-pub const TRAMPOLINE_BASE: u64 = 0x0000_0080_0010_0000;
-
 /// Machine code of the trampoline: `mov rax, 15; syscall; ud2`.
 ///
 /// The handler returns with `ret`, which pops the address the kernel pushed as
 /// its return slot, so the trampoline runs with the frame base one word below
-/// `rsp`. `sys_sigreturn` locates the frame from there.
+/// `rsp`. `sys_sigreturn` locates the frame from there. The page itself lives
+/// at `mm::uaccess::TRAMPOLINE_BASE` and is mapped by the ELF loader.
 pub const TRAMPOLINE_CODE: [u8; 11] = [
     0x48,
     0xC7,
@@ -319,7 +312,8 @@ pub struct SigAction {
     /// `SIG_DFL`, `SIG_IGN`, or a user virtual address in the program window.
     pub handler: u64,
     pub flags: u64,
-    /// Only meaningful with `SA_RESTORER`; otherwise `TRAMPOLINE_BASE` is used.
+    /// Only meaningful with `SA_RESTORER`; otherwise the kernel trampoline is
+    /// used.
     pub restorer: u64,
     /// Extra signals blocked while the handler runs.
     pub mask: SigSet,
@@ -587,10 +581,16 @@ pub const SIGNAL_FRAME_MAGIC: u64 = 0x5349_474E_414C_4652;
 
 pub const SIGNAL_FRAME_SIZE: usize = size_of::<SignalFrame>();
 
+/// Offsets the delivery path passes to a `SA_SIGINFO` handler (`rsi`/`rdx`).
+pub const SIGNAL_FRAME_CONTEXT_OFFSET: usize = core::mem::offset_of!(SignalFrame, context);
+pub const SIGNAL_FRAME_INFO_OFFSET: usize = core::mem::offset_of!(SignalFrame, info);
+
 const _: () = assert!(SIGNAL_FRAME_SIZE == 216);
 const _: () = assert!(size_of::<SigContext>() == 160);
 const _: () = assert!(size_of::<Siginfo>() == 24);
 const _: () = assert!(size_of::<SigSet>() == 8);
+const _: () = assert!(SIGNAL_FRAME_CONTEXT_OFFSET == 8);
+const _: () = assert!(SIGNAL_FRAME_INFO_OFFSET == 184);
 
 impl SignalFrame {
     pub const fn new(

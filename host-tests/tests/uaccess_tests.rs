@@ -1,6 +1,6 @@
 use hosttest::uaccess::{
-    pml4_index, range_valid, stack_valid, PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE, STACK_TOP,
-    USER_PML4_INDEX,
+    pml4_index, range_valid, stack_valid, trampoline_valid, PROGRAM_BASE, PROGRAM_SIZE, STACK_BASE,
+    STACK_TOP, TRAMPOLINE_BASE, TRAMPOLINE_END, TRAMPOLINE_SIZE, USER_PML4_INDEX,
 };
 
 #[test]
@@ -46,6 +46,26 @@ fn user_ranges_live_in_a_single_pml4_slot() {
     assert_eq!(pml4_index(PROGRAM_BASE), USER_PML4_INDEX);
     assert_eq!(pml4_index(STACK_BASE), USER_PML4_INDEX);
     assert_eq!(pml4_index(STACK_TOP - 1), USER_PML4_INDEX);
+    assert_eq!(pml4_index(TRAMPOLINE_BASE), USER_PML4_INDEX);
     assert_eq!(pml4_index(0), 0);
     assert_eq!(pml4_index(0x4444_0000_0000), 136);
+}
+
+#[test]
+fn trampoline_page_sits_between_the_program_and_the_stack() {
+    assert_eq!(TRAMPOLINE_BASE, 0x0000_0080_0010_0000);
+    assert_eq!(TRAMPOLINE_BASE % 4096, 0);
+    assert_eq!(TRAMPOLINE_SIZE, 4096);
+    assert_eq!(TRAMPOLINE_END, TRAMPOLINE_BASE + TRAMPOLINE_SIZE);
+    assert!(TRAMPOLINE_BASE >= PROGRAM_BASE + PROGRAM_SIZE);
+    assert!(TRAMPOLINE_END <= STACK_BASE);
+
+    assert!(trampoline_valid(TRAMPOLINE_BASE, 1));
+    assert!(trampoline_valid(TRAMPOLINE_BASE, TRAMPOLINE_SIZE));
+    assert!(!trampoline_valid(TRAMPOLINE_BASE, TRAMPOLINE_SIZE + 1));
+    assert!(!trampoline_valid(TRAMPOLINE_BASE - 1, 1));
+    assert!(!trampoline_valid(TRAMPOLINE_END, 1));
+
+    // The trampoline is executable by ring 3, never a syscall buffer.
+    assert!(!range_valid(TRAMPOLINE_BASE, 1));
 }

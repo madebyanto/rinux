@@ -27,17 +27,17 @@ pub enum ProcessError {
 ///
 /// Rinux supports the standard signals only, so the state is one pending bit
 /// per signal and one disposition per signal. `interrupted` records that a
-/// blocking syscall was woken by a signal, so the syscall layer can turn the
-/// wakeup into `EINTR` once delivery is wired up.
+/// blocking syscall was woken by a signal, so the syscall layer can turn that
+/// wakeup into `EINTR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalState {
-    #[allow(dead_code)] // read by the delivery loop in the next step
     pub pending: SigSet,
     pub blocked: SigSet,
     pub actions: [SigAction; NSIG],
-    #[allow(dead_code)] // handler nesting, incremented by delivery
+    /// Handler nesting, incremented on delivery and decremented by
+    /// `rt_sigreturn`.
     pub depth: u8,
-    #[allow(dead_code)] // consumed by interruptible syscalls once wired up
+    #[allow(dead_code)] // read by interruptible syscalls once wired up
     pub interrupted: bool,
 }
 
@@ -100,8 +100,7 @@ impl Default for SignalState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitStatus {
     Exited(i32),
-    /// Produced by the delivery path once fatal signals are wired up.
-    #[allow(dead_code)]
+    /// Produced by the delivery path for an uncaught fatal signal.
     Signaled(Signal),
 }
 
