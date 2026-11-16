@@ -1,7 +1,8 @@
 use super::context::{self, Context, KERNEL_STACK_SIZE};
 use super::pid::Pid;
 use super::signal::{
-    default_action, signal_wait_status, DefaultAction, SigAction, SigSet, Siginfo, Signal, NSIG,
+    default_action, signal_wait_status, DefaultAction, SigAction, SigSet, Siginfo, Signal,
+    CLD_DUMPED, CLD_EXITED, CLD_KILLED, NSIG,
 };
 use super::wait::WaitTarget;
 use crate::arch::x86_64::syscall::SyscallFrame;
@@ -25,12 +26,26 @@ pub enum ProcessError {
     OutOfMemory,
 }
 
+/// A blocking syscall that a signal interrupted.
+///
+/// Recorded by the syscall layer as it returns `EINTR` and consumed by the
+/// next delivery attempt. If the handler was installed with `SA_RESTART` and
+/// the call is restartable, delivery rewinds the saved instruction pointer so
+/// `rt_sigreturn` re-executes the call after the handler returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptedSyscall {
+    /// Original syscall number (the value of `rax` at entry).
+    pub number: u64,
+    pub restartable: bool,
+}
+
 /// Per-process signal state.
 ///
 /// Rinux supports the standard signals only, so the state is one pending bit
 /// and one captured `siginfo_t` per signal, plus one disposition per signal.
 /// `interrupted` records that a blocking syscall was woken by a signal, so the
-/// syscall layer can turn that wakeup into `EINTR`.
+/// syscall layer can turn that wakeup into `EINTR`; `interrupted_syscall`
+/// remembers the call itself so `SA_RESTART` can re-execute it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalState {
     pub pending: SigSet,
@@ -43,8 +58,12 @@ pub struct SignalState {
     /// Handler nesting, incremented on delivery and decremented by
     /// `rt_sigreturn`.
     pub depth: u8,
-    #[allow(dead_code)] // read by interruptible syscalls once wired up
+    #[allow(dead_code)] // written by the blocking layer, informational only
     pub interrupted: bool,
+    /// The blocking syscall that returned `EINTR`, if any. Cleared when the
+    /// next delivery attempt runs, so a stale record can never restart a
+    /// later, unrelated syscall.
+    pub interrupted_syscall: Option<InterruptedSyscall>,
 }
 
 impl SignalState {
@@ -56,6 +75,7 @@ impl SignalState {
             actions: [SigAction::DEFAULT; NSIG],
             depth: 0,
             interrupted: false,
+            interrupted_syscall: None,
         }
     }
 
@@ -69,6 +89,7 @@ impl SignalState {
             actions: parent.actions,
             depth: 0,
             interrupted: false,
+            interrupted_syscall: None,
         }
     }
 
@@ -121,6 +142,24 @@ impl ExitStatus {
         match self {
             Self::Exited(code) => (code & 0xFF) << 8,
             Self::Signaled(signal) => signal_wait_status(signal),
+        }
+    }
+
+    /// `SIGCHLD` payload for the parent of `pid`.
+    ///
+    /// `si_code` distinguishes a normal exit from a signal death and sets
+    /// `CLD_DUMPED` when the default action produces a core dump.
+    pub const fn child_info(self, pid: Pid) -> Siginfo {
+        match self {
+            Self::Exited(code) => Siginfo::child(pid, CLD_EXITED, code),
+            Self::Signaled(signal) => {
+                let code = if matches!(default_action(signal), DefaultAction::TerminateCore) {
+                    CLD_DUMPED
+                } else {
+                    CLD_KILLED
+                };
+                Siginfo::child(pid, code, signal.number() as i32)
+            }
         }
     }
 }

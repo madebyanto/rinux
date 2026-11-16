@@ -1,6 +1,6 @@
 use super::context::{self, Context};
 use super::pid::{Pid, PidAllocator, INIT_PID};
-use super::process::{ExitStatus, Process, ProcessState, SignalState, TaskEntry};
+use super::process::{ExitStatus, InterruptedSyscall, Process, ProcessState, SignalState, TaskEntry};
 use super::queue::{ReadyQueue, MAX_PROCESSES};
 use super::reap::ReapList;
 use super::signal::{
@@ -182,6 +182,21 @@ impl Scheduler {
         })
     }
 
+    /// The next pending signal that should interrupt a blocking syscall.
+    ///
+    /// Blocked signals are skipped, and so are ignored ones: `SIG_IGN` and
+    /// default-ignored signals such as `SIGCHLD` must not break a read or a
+    /// `waitpid`. `next_interrupting` is non-mutating, so the pending set is
+    /// left for the delivery path to prune.
+    fn interrupting_signal(&self, pid: Pid) -> Option<Signal> {
+        let process = self.process(pid)?;
+        signal::next_interrupting(
+            process.signals.pending,
+            process.signals.blocked,
+            &process.signals.actions,
+        )
+    }
+
     fn process(&self, pid: Pid) -> Option<&Process> {
         self.processes
             .iter()
@@ -321,6 +336,11 @@ where
             return Err(SchedulerError::NoCurrentProcess);
         };
         if ready() {
+            false
+        } else if scheduler.interrupting_signal(pid).is_some() {
+            // A signal is already pending: return without sleeping so the
+            // caller retries the I/O and then reports `EINTR`. This also
+            // closes the race between the caller's check and registration.
             false
         } else {
             if !scheduler.register_pipe_waiter(id, direction, pid) {
@@ -499,6 +519,43 @@ pub fn raise_current_signal(signal: Signal, info: Siginfo) -> Result<(), SignalE
     })
 }
 
+/// The next pending signal that would interrupt a blocking syscall, if any.
+///
+/// Excludes blocked signals, `SIG_IGN` and default-ignored signals, so a
+/// default-ignored `SIGCHLD` does not spuriously break a blocking `read`.
+pub fn pending_interrupting() -> Option<Signal> {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut()?;
+        let pid = scheduler.current?;
+        scheduler.interrupting_signal(pid)
+    })
+}
+
+/// Records the syscall a blocking loop is about to abandon with `EINTR`.
+///
+/// `restartable` marks calls that `SA_RESTART` may transparently re-execute
+/// (reads, writes and `waitpid`). The record is consumed by the next delivery
+/// attempt, where it rewinds the saved context if the handler asked to restart.
+pub fn note_interrupted_syscall(number: u64, restartable: bool) {
+    cpu::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return;
+        };
+        let Some(pid) = scheduler.current else {
+            return;
+        };
+        if let Some(process) = scheduler.process_mut(pid) {
+            process.signals.interrupted = true;
+            process.signals.interrupted_syscall = Some(InterruptedSyscall {
+                number,
+                restartable,
+            });
+        }
+    });
+}
+
 /// Broadcast form of [`send_signal`], used by `kill(-1, sig)`.
 ///
 /// PID 1 and the caller are skipped; a `None` signal performs the existence
@@ -657,6 +714,7 @@ pub fn reset_signals_for_exec() -> Result<(), SignalError> {
         signals.pending_info.fill(Siginfo::EMPTY);
         signals.depth = 0;
         signals.interrupted = false;
+        signals.interrupted_syscall = None;
         Ok(())
     })
 }
@@ -672,6 +730,8 @@ struct HandlerPlan {
     action: SigAction,
     blocked: SigSet,
     info: Siginfo,
+    /// The syscall the task abandoned with `EINTR`, if any.
+    interrupted: Option<InterruptedSyscall>,
 }
 
 enum DeliveryPlan {
@@ -689,6 +749,12 @@ fn plan_delivery() -> Option<DeliveryPlan> {
         let pid = scheduler.current?;
         let process = scheduler.process_mut(pid)?;
         let signals = &mut process.signals;
+        // `interrupted_syscall` describes only the current syscall return, so
+        // clear it on every attempt: a stale record must never make a later
+        // delivery restart an unrelated syscall (for example on the iretq
+        // path, where no syscall was interrupted at all).
+        let interrupted = signals.interrupted_syscall.take();
+        signals.interrupted = false;
         let signal = signal::next_deliverable(
             &mut signals.pending,
             signals.blocked,
@@ -704,6 +770,7 @@ fn plan_delivery() -> Option<DeliveryPlan> {
             action,
             blocked: signals.blocked,
             info: signals.pending_info[signal.index()],
+            interrupted,
         }))
     })
 }
@@ -770,6 +837,16 @@ fn deliver_handler(context: &mut UserContext, plan: HandlerPlan) {
     } else {
         uaccess::TRAMPOLINE_BASE as u64
     };
+    if let Some(interrupted) = plan.interrupted {
+        if interrupted.restartable && plan.action.restarts() {
+            // `syscall` is a two-byte instruction and `user_rip` already points
+            // past it. Step back and restore the original number in `rax` so
+            // the context saved in the frame re-executes the call after
+            // `rt_sigreturn`, instead of continuing with the `-EINTR` value.
+            context.rip = context.rip.saturating_sub(2);
+            context.rax = interrupted.number;
+        }
+    }
     let frame = SignalFrame::new(
         restorer,
         context.to_sig_context(),
@@ -1029,9 +1106,13 @@ pub fn block_on_child(target: WaitTarget) -> Result<(), SchedulerError> {
         match guard.as_mut() {
             Some(scheduler) => match scheduler.current {
                 Some(pid) => {
-                    // A child may have exited after `try_wait` decided to block.
-                    // Recheck while registering so the wakeup cannot be lost.
-                    if scheduler.has_zombie_child(pid, target) {
+                    // A child may have exited after `try_wait` decided to block,
+                    // and a signal may have arrived before registration. Recheck
+                    // both while registering so a wakeup cannot be lost; the
+                    // caller reaps first and only then reports `EINTR`.
+                    if scheduler.has_zombie_child(pid, target)
+                        || scheduler.interrupting_signal(pid).is_some()
+                    {
                         (Ok(()), false)
                     } else {
                         match scheduler.process_mut(pid) {
@@ -1087,30 +1168,40 @@ pub fn on_timer_tick() {
 pub fn block_on_keyboard() -> Result<(), SchedulerError> {
     let flags = cpu::read_rflags();
     cpu::disable_interrupts();
-    let result = {
+    let (result, wait) = {
         let mut guard = SCHEDULER.lock();
         match guard.as_mut() {
             Some(scheduler) => match scheduler.current {
-                Some(pid) => match scheduler.keyboard_waiters.push(pid) {
-                    Ok(()) => match scheduler.process_mut(pid) {
-                        Some(process) => {
-                            process.state = ProcessState::Blocked;
-                            Ok(())
+                Some(pid) => {
+                    if scheduler.interrupting_signal(pid).is_some() {
+                        // Do not sleep; the caller retries the keyboard and
+                        // reports `EINTR` if nothing arrived.
+                        (Ok(()), false)
+                    } else {
+                        match scheduler.keyboard_waiters.push(pid) {
+                            Ok(()) => match scheduler.process_mut(pid) {
+                                Some(process) => {
+                                    process.state = ProcessState::Blocked;
+                                    (Ok(()), true)
+                                }
+                                None => {
+                                    let _ = scheduler.keyboard_waiters.remove(pid);
+                                    (Err(SchedulerError::NoCurrentProcess), false)
+                                }
+                            },
+                            Err(QueueError::Full) => {
+                                (Err(SchedulerError::KeyboardQueueFull), false)
+                            }
+                            Err(_) => (Err(SchedulerError::NoCurrentProcess), false),
                         }
-                        None => {
-                            let _ = scheduler.keyboard_waiters.remove(pid);
-                            Err(SchedulerError::NoCurrentProcess)
-                        }
-                    },
-                    Err(QueueError::Full) => Err(SchedulerError::KeyboardQueueFull),
-                    Err(_) => Err(SchedulerError::NoCurrentProcess),
-                },
-                None => Err(SchedulerError::NoCurrentProcess),
+                    }
+                }
+                None => (Err(SchedulerError::NoCurrentProcess), false),
             },
-            None => Err(SchedulerError::NotInitialized),
+            None => (Err(SchedulerError::NotInitialized), false),
         }
     };
-    if result.is_ok() {
+    if wait {
         schedule();
     }
     cpu::restore_rflags(flags);
@@ -1195,6 +1286,13 @@ fn exit_current_status(status: ExitStatus) -> ! {
                                 let _ = scheduler.ready.push(parent_pid);
                             }
                         }
+                    }
+                    if parent_alive {
+                        // Notify the original, live parent only. The orphaned
+                        // children reparented below get no synthetic SIGCHLD,
+                        // so init is never woken for a child it did not fork.
+                        let info = status.child_info(pid);
+                        let _ = scheduler.queue_signal(parent_pid, Signal::CHLD, info);
                     }
                 }
                 // Every orphan is reparented to PID 1, including zombies that

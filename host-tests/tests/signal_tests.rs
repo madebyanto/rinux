@@ -439,6 +439,28 @@ fn wait_status_encodes_termination_signal_and_core_flag() {
 }
 
 #[test]
+fn next_interrupting_honours_dispositions_and_the_blocked_mask() {
+    let mut actions = empty_actions();
+    actions[Signal::USR1.index()] = SigAction::with_handler(0x0000_0080_0000_1000);
+    actions[Signal::USR2.index()] = SigAction::IGNORE;
+
+    // Default-ignored `SIGCHLD` and an explicitly ignored `SIGUSR2` never
+    // interrupt a blocking syscall; the caught `SIGUSR1` does.
+    let pending = set(&[Signal::CHLD, Signal::USR2, Signal::USR1]);
+    assert_eq!(
+        next_interrupting(pending, SigSet::EMPTY, &actions),
+        Some(Signal::USR1)
+    );
+
+    // A blocked caught signal is skipped and only ignored signals remain.
+    let pending = set(&[Signal::CHLD, Signal::USR1]);
+    assert_eq!(
+        next_interrupting(pending, set(&[Signal::USR1]), &actions),
+        None
+    );
+}
+
+#[test]
 fn sigcontext_layout_matches_the_syscall_frame() {
     assert_eq!(size_of::<SigContext>(), 160);
     assert_eq!(offset_of!(SigContext, r15), 0);

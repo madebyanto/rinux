@@ -25,7 +25,6 @@ pub const ECHILD: i64 = 10;
 pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const ESRCH: i64 = 3;
-#[allow(dead_code)] // returned by interruptible syscalls once delivery is wired up
 pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;

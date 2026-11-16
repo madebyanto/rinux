@@ -97,6 +97,11 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
                     unsafe { core::ptr::write_volatile(buf as *mut u8, key) };
                     return 1;
                 }
+                // Retry the keyboard first, then let an interrupting signal win.
+                if scheduler::pending_interrupting().is_some() {
+                    scheduler::note_interrupted_syscall(abi::SYS_READ, true);
+                    return abi::errno(abi::EINTR);
+                }
                 match scheduler::block_on_keyboard() {
                     Ok(()) => {}
                     Err(scheduler::SchedulerError::KeyboardQueueFull) => {
@@ -149,6 +154,13 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
                     pipe::ReadOutcome::Data(count) => return count as u64,
                     pipe::ReadOutcome::EndOfFile => return 0,
                     pipe::ReadOutcome::Empty => {
+                        // A wakeup may have been a signal rather than new data:
+                        // the loop retries the pipe first and only then reports
+                        // `EINTR` if an interrupting signal is still pending.
+                        if scheduler::pending_interrupting().is_some() {
+                            scheduler::note_interrupted_syscall(abi::SYS_READ, true);
+                            return abi::errno(abi::EINTR);
+                        }
                         if let Err(error) =
                             scheduler::block_on_pipe(end.id(), PipeDirection::Read, || end.readable())
                         {
@@ -203,6 +215,10 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
                 match end.try_write(bytes) {
                     pipe::WriteOutcome::Written(count) => return count as u64,
                     pipe::WriteOutcome::Full => {
+                        if scheduler::pending_interrupting().is_some() {
+                            scheduler::note_interrupted_syscall(abi::SYS_WRITE, true);
+                            return abi::errno(abi::EINTR);
+                        }
                         if let Err(error) = scheduler::block_on_pipe(
                             end.id(),
                             PipeDirection::Write,
@@ -211,7 +227,15 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
                             return scheduler_errno(error);
                         }
                     }
-                    pipe::WriteOutcome::BrokenPipe => return abi::errno(abi::EPIPE),
+                    pipe::WriteOutcome::BrokenPipe => {
+                        // As on Linux, the write reports `EPIPE` to the caller
+                        // and the pending `SIGPIPE` is delivered on the way
+                        // back to ring 3 (terminating the task by default).
+                        let info =
+                            signal::Siginfo::kernel(Signal::PIPE, signal::SI_KERNEL, 0);
+                        let _ = scheduler::raise_current_signal(Signal::PIPE, info);
+                        return abi::errno(abi::EPIPE);
+                    }
                     pipe::WriteOutcome::WrongDirection => return abi::errno(abi::EBADF),
                 }
             }
@@ -408,6 +432,13 @@ fn sys_waitpid(pid: u64, status: u64, options: u64) -> u64 {
             WaitResult::Block => {
                 if no_hang {
                     return 0;
+                }
+                // Reaping is retried at the top of the loop before `EINTR` is
+                // reported, so a child that exited while blocked is collected
+                // even when a `SIGCHLD`/other signal is pending.
+                if scheduler::pending_interrupting().is_some() {
+                    scheduler::note_interrupted_syscall(abi::SYS_WAITPID, true);
+                    return abi::errno(abi::EINTR);
                 }
                 if let Err(error) = scheduler::block_on_child(target) {
                     return scheduler_errno(error);
