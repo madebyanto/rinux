@@ -11,7 +11,7 @@ Hobby x86-64 kernel in Rust (`no_std`, no external crates), booted by Multiboot2
 - `make debug` adds a gdb stub (`-s -S`, :1234); symbols are at `target/x86_64-rinux/debug/rinux`.
 - Headless smoke test (with a root filesystem): `timeout 10 make run QEMU='qemu-system-x86_64 -display none' ROOTFS=/path/to/rootfs.img`. Timeout exits 124; look for `Rinux 0.1.0`, `cmdline:` diagnostics, ext2 mount messages, and `Run <path> as init process`. Without `ROOTFS`, expect the fail-fast message instead.
 - `make check` (or `cargo check`) no longer runs a `build.rs`; GNU `as` and `ld` are not needed for type-checking or the kernel build. `objcopy`, `grub-mkrescue`, and `xorriso` are needed for `make image`.
-- Prerequisites beyond the README: binutils (`objcopy`), `grub-mkrescue` + `xorriso`, QEMU, and nightly with `rust-src` (see `rust-toolchain.toml`). `mke2fs` is needed only by `ext2_tests`.
+- Prerequisites beyond the README: binutils (`objcopy`), `grub-mkrescue` + `xorriso`, QEMU, and nightly with `rust-src` (see `rust-toolchain.toml`). `mke2fs` and `e2fsck` are needed only by `ext2_tests`.
 - `make clean` runs `cargo clean` and removes `build/`; it does not clean `host-tests/target`.
 - `build.sh` is an interactive menu that runs `cargo clean` before building; use Make targets for non-interactive work.
 
@@ -27,7 +27,7 @@ HOST_TESTS="$PWD/host-tests"
 Do not run `cargo test` inside the repo (even from `host-tests/`): Cargo merges the root `.cargo/config.toml` (`build-std`), which makes the host build fail with a duplicate `alloc` lang item. Running outside the tree avoids that config while `--manifest-path` still finds the tests; `+nightly` restores the pinned toolchain that cwd-based rustup discovery loses.
 
 - One suite: `... --test frame_tests`. One test: `... --test ext2_tests <filter>`.
-- `ext2_tests` requires `mke2fs`; no other test needs QEMU or real hardware.
+- `ext2_tests` requires `mke2fs` and `e2fsck`; no other test needs QEMU or real hardware.
 - `host-tests/src/lib.rs` includes kernel sources via `#[path = "../../src/..."]`; generic fs modules are listed in `host-tests/src/fs.rs`. Add new shared modules there instead of copying code. Keep hardware-only code behind `#[cfg(target_os = "none")]` (see `src/drivers/ps2.rs` and `ata.rs`); `arch::x86_64::cpu` and frame-allocation shims live in `lib.rs`.
 
 ## Architecture notes

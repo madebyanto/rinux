@@ -148,7 +148,6 @@ mod backend {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn write_sectors(lba: u32, count: usize, buffer: &[u8]) -> Result<(), AtaError> {
         let guard = ATA.lock();
         if guard.is_none() {
@@ -166,7 +165,18 @@ mod backend {
             offset = end;
             remaining -= chunk;
         }
-        flush()
+        flush_locked()
+    }
+
+    /// Flush the drive's write cache. Filesystem code calls this after a batch
+    /// of metadata writes, while `write_sectors` flushes each transfer.
+    #[allow(dead_code)]
+    pub fn flush() -> Result<(), AtaError> {
+        let guard = ATA.lock();
+        if guard.is_none() {
+            return Err(AtaError::NotInitialized);
+        }
+        flush_locked()
     }
 
     fn identify() -> Result<AtaInfo, AtaError> {
@@ -243,7 +253,7 @@ mod backend {
         wait_idle(lba + count as u32 - 1)
     }
 
-    fn flush() -> Result<(), AtaError> {
+    fn flush_locked() -> Result<(), AtaError> {
         unsafe {
             outb(DRIVE_HEAD, 0xA0);
         }
@@ -379,4 +389,4 @@ mod backend {
 
 #[cfg(target_os = "none")]
 #[allow(unused_imports)]
-pub use backend::{init, read_sectors, write_sectors};
+pub use backend::{flush, init, read_sectors, write_sectors};

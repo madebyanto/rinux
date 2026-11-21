@@ -1,6 +1,6 @@
 #[path = "../../src/fs/elf.rs"]
 pub mod elf;
-#[path = "../../src/fs/ext2.rs"]
+#[path = "../../src/fs/ext2/mod.rs"]
 pub mod ext2;
 #[path = "../../src/fs/fd.rs"]
 pub mod fd;
@@ -8,5 +8,6 @@ pub mod fd;
 pub mod mbr;
 #[path = "../../src/fs/pipe.rs"]
 pub mod pipe;
+pub mod ramdisk;
 #[path = "../../src/fs/vfs.rs"]
 pub mod vfs;

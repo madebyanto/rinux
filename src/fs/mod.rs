@@ -61,19 +61,39 @@ struct AtaDevice {
     sectors: u32,
 }
 
-impl BlockDevice for AtaDevice {
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Ext2Error> {
-        if offset % 512 != 0 || buffer.len() % 512 != 0 || buffer.is_empty() {
+impl AtaDevice {
+    fn transfer_lba(
+        &self,
+        offset: u64,
+        buffer_len: usize,
+    ) -> Result<(u32, u32), Ext2Error> {
+        if offset % 512 != 0 || buffer_len % 512 != 0 || buffer_len == 0 {
             return Err(Ext2Error::Device);
         }
-        let count = (buffer.len() / 512) as u32;
+        let count = (buffer_len / 512) as u32;
         let lba = mbr::absolute_lba(self.start_lba, offset).map_err(|_| Ext2Error::OutOfBounds)?;
         let end = lba as u64 + count as u64;
         let partition_end = self.start_lba as u64 + self.sectors as u64;
         if end > partition_end {
             return Err(Ext2Error::OutOfBounds);
         }
+        Ok((lba, count))
+    }
+}
+
+impl BlockDevice for AtaDevice {
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), Ext2Error> {
+        let (lba, count) = self.transfer_lba(offset, buffer.len())?;
         ata::read_sectors(lba, count as usize, buffer).map_err(|_| Ext2Error::Device)
+    }
+
+    fn write_at(&mut self, offset: u64, buffer: &[u8]) -> Result<(), Ext2Error> {
+        let (lba, count) = self.transfer_lba(offset, buffer.len())?;
+        ata::write_sectors(lba, count as usize, buffer).map_err(|_| Ext2Error::Device)
+    }
+
+    fn flush(&mut self) -> Result<(), Ext2Error> {
+        ata::flush().map_err(|_| Ext2Error::Device)
     }
 }
 
@@ -92,7 +112,7 @@ pub fn mount(disk_sectors: u32) -> Result<MountInfo, MountError> {
         start_lba: partition.start_lba,
         sectors: partition.sectors,
     };
-    let filesystem = Ext2::mount(device).map_err(MountError::Ext2)?;
+    let filesystem = Ext2::mount_rw(device).map_err(MountError::Ext2)?;
     let volume = String::from(filesystem.superblock().volume_name());
     let info = MountInfo {
         partition,

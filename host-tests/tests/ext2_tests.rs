@@ -1,6 +1,10 @@
+use hosttest::fs::ext2::bitmap::Bitmap;
+use hosttest::fs::ext2::layout;
+use hosttest::fs::ext2::structs::Superblock;
 use hosttest::fs::ext2::{
     block_path, parse_dir_entry, BlockDevice, BlockPath, Ext2, Ext2Error,
 };
+use hosttest::fs::ramdisk::RamDisk;
 use hosttest::fs::vfs::{DirCursor, FileType, Vfs};
 use std::fs;
 use std::path::PathBuf;
@@ -47,6 +51,40 @@ fn build_image() -> Vec<u8> {
 
 fn pattern(index: usize) -> u8 {
     index.wrapping_mul(31).wrapping_add(7) as u8
+}
+
+fn build_minimal_image(block_size: &str, inode_size: &str, blocks: &str) -> Vec<u8> {
+    let base = std::env::temp_dir().join(format!(
+        "rinux-ext2-min-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let root = base.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("hello.txt"), b"hello\n").unwrap();
+    let image = base.join("image");
+    let status = Command::new("mke2fs")
+        .args([
+            "-t",
+            "ext2",
+            "-b",
+            block_size,
+            "-I",
+            inode_size,
+            "-F",
+            "-d",
+        ])
+        .arg(&root)
+        .arg(&image)
+        .arg(blocks)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("mke2fs must be installed");
+    assert!(status.success(), "mke2fs failed");
+    let data = fs::read(&image).unwrap();
+    fs::remove_dir_all(&base).ok();
+    data
 }
 
 struct MemoryDevice {
@@ -322,4 +360,270 @@ fn vfs_wraps_ext2_open_read_stat_seek_and_readdir() {
     }
     assert!(found);
     assert!(vfs.open("/missing").is_err());
+}
+
+fn superblock_bytes() -> [u8; 1024] {
+    let data = image();
+    let mut raw = [0u8; 1024];
+    raw.copy_from_slice(&data[1024..2048]);
+    raw
+}
+
+fn synthetic_superblock(
+    blocks_count: u32,
+    blocks_per_group: u32,
+    inodes_count: u32,
+    inodes_per_group: u32,
+) -> Superblock {
+    let mut raw = superblock_bytes();
+    raw[0..4].copy_from_slice(&inodes_count.to_le_bytes());
+    raw[4..8].copy_from_slice(&blocks_count.to_le_bytes());
+    raw[32..36].copy_from_slice(&blocks_per_group.to_le_bytes());
+    raw[40..44].copy_from_slice(&inodes_per_group.to_le_bytes());
+    Superblock::parse(&raw).unwrap()
+}
+
+fn fresh_rw() -> Ext2<RamDisk> {
+    Ext2::mount_rw_with_clock(RamDisk::new(image()), || 1_700_000_000).unwrap()
+}
+
+fn e2fsck(data: &[u8]) {
+    let path = std::env::temp_dir().join(format!(
+        "rinux-fsck-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, data).unwrap();
+    let output = Command::new("e2fsck")
+        .args(["-f", "-n"])
+        .arg(&path)
+        .output()
+        .expect("e2fsck must be installed");
+    fs::remove_file(&path).ok();
+    assert!(
+        output.status.success(),
+        "e2fsck failed with {:?}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn bitmap_sets_clears_and_finds_free_bits() {
+    let mut bitmap = Bitmap::new(2);
+    assert_eq!(bitmap.len_bits(), 16);
+    assert_eq!(bitmap.count_free(16), 16);
+    assert_eq!(bitmap.first_free(16, 0), Some(0));
+
+    bitmap.set(0);
+    bitmap.set(9);
+    bitmap.set(15);
+    assert!(bitmap.is_set(0));
+    assert!(bitmap.is_set(9));
+    assert!(bitmap.is_set(15));
+    assert!(!bitmap.is_set(1));
+    assert_eq!(bitmap.count_free(16), 13);
+    assert_eq!(bitmap.first_free(16, 0), Some(1));
+    assert_eq!(bitmap.first_free(16, 9), Some(10));
+    assert_eq!(bitmap.first_free(16, 15), None);
+    assert_eq!(bitmap.first_free(12, 0), Some(1));
+
+    bitmap.clear(0);
+    assert_eq!(bitmap.first_free(16, 0), Some(0));
+    assert_eq!(bitmap.count_free(16), 14);
+
+    // Bits outside the backing store are reported clear but never panic.
+    assert!(!bitmap.is_set(1_000));
+    bitmap.set(1_000);
+    bitmap.clear(1_000);
+
+    let round_trip = Bitmap::from_bytes(bitmap.as_bytes().to_vec());
+    assert_eq!(round_trip, bitmap);
+}
+
+#[test]
+fn group_math_clamps_the_last_group() {
+    let superblock = synthetic_superblock(20_000, 8_192, 4_096, 2_048);
+    assert_eq!(superblock.groups(), 3);
+    assert_eq!(superblock.first_data_block(), 1);
+
+    assert_eq!(layout::blocks_in_group(&superblock, 0), 8_192);
+    assert_eq!(layout::blocks_in_group(&superblock, 1), 8_192);
+    assert_eq!(layout::blocks_in_group(&superblock, 2), 3_615);
+    assert_eq!(layout::blocks_in_group(&superblock, 3), 0);
+
+    assert_eq!(layout::block_location(&superblock, 0), None);
+    assert_eq!(layout::block_location(&superblock, 1), Some((0, 0)));
+    assert_eq!(layout::block_location(&superblock, 8_192), Some((0, 8_191)));
+    assert_eq!(layout::block_location(&superblock, 8_193), Some((1, 0)));
+    assert_eq!(layout::block_location(&superblock, 20_000), None);
+    assert_eq!(layout::block_number(&superblock, 0, 0), Some(1));
+    assert_eq!(layout::block_number(&superblock, 2, 0), Some(16_385));
+    assert_eq!(layout::block_number(&superblock, 2, 3_614), Some(19_999));
+    assert_eq!(layout::block_number(&superblock, 2, 3_615), None);
+    assert_eq!(layout::block_number(&superblock, 0, 8_192), None);
+
+    assert_eq!(layout::inodes_in_group(&superblock, 0), 2_048);
+    assert_eq!(layout::inodes_in_group(&superblock, 1), 2_048);
+    assert_eq!(layout::inodes_in_group(&superblock, 2), 0);
+    assert_eq!(layout::inode_location(&superblock, 0), None);
+    assert_eq!(layout::inode_location(&superblock, 1), Some((0, 0)));
+    assert_eq!(layout::inode_location(&superblock, 2_048), Some((0, 2_047)));
+    assert_eq!(layout::inode_location(&superblock, 2_049), Some((1, 0)));
+    assert_eq!(layout::inode_location(&superblock, 4_096), Some((1, 2_047)));
+    assert_eq!(layout::inode_location(&superblock, 4_097), None);
+    assert_eq!(layout::inode_number(&superblock, 0, 0), Some(1));
+    assert_eq!(layout::inode_number(&superblock, 1, 0), Some(2_049));
+    assert_eq!(layout::inode_number(&superblock, 1, 2_047), Some(4_096));
+    assert_eq!(layout::inode_number(&superblock, 1, 2_048), None);
+
+    assert_eq!(layout::first_inode_bit(&superblock, 0), 10);
+    assert_eq!(layout::first_inode_bit(&superblock, 1), 0);
+}
+
+#[test]
+fn read_only_mount_rejects_allocation_and_free() {
+    let mut filesystem = Ext2::mount(RamDisk::new(image())).unwrap();
+    assert!(filesystem.is_read_only());
+    assert_eq!(filesystem.allocate_block(0), Err(Ext2Error::ReadOnly));
+    assert_eq!(filesystem.allocate_inode(0, false), Err(Ext2Error::ReadOnly));
+    assert_eq!(filesystem.free_block(1), Err(Ext2Error::ReadOnly));
+    assert_eq!(filesystem.free_inode(11, false), Err(Ext2Error::ReadOnly));
+    filesystem.sync().unwrap();
+}
+
+#[test]
+fn ramdisk_allocates_and_frees_blocks_and_inodes() {
+    let mut filesystem = fresh_rw();
+    assert!(!filesystem.is_read_only());
+
+    let free_blocks = filesystem.superblock().free_blocks_count();
+    let free_inodes = filesystem.superblock().free_inodes_count();
+    let descriptor = *filesystem.group_descriptor(0).unwrap();
+    assert_eq!(descriptor.free_blocks_count as u32, free_blocks);
+
+    let first = filesystem.allocate_block(0).unwrap();
+    assert!(filesystem.is_block_allocated(first).unwrap());
+    assert_eq!(filesystem.superblock().free_blocks_count(), free_blocks - 1);
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().free_blocks_count as u32,
+        free_blocks - 1
+    );
+
+    let second = filesystem.allocate_block(0).unwrap();
+    assert_ne!(first, second);
+    assert!(filesystem.is_block_allocated(second).unwrap());
+    assert_eq!(filesystem.superblock().free_blocks_count(), free_blocks - 2);
+
+    filesystem.free_block(first).unwrap();
+    assert!(!filesystem.is_block_allocated(first).unwrap());
+    assert_eq!(filesystem.superblock().free_blocks_count(), free_blocks - 1);
+
+    filesystem.free_block(second).unwrap();
+    assert_eq!(filesystem.superblock().free_blocks_count(), free_blocks);
+
+    let inode = filesystem.allocate_inode(0, false).unwrap();
+    assert!(filesystem.is_inode_allocated(inode).unwrap());
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes - 1);
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().free_inodes_count as u32,
+        free_inodes - 1
+    );
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().used_dirs_count,
+        descriptor.used_dirs_count
+    );
+
+    let directory = filesystem.allocate_inode(0, true).unwrap();
+    assert_ne!(inode, directory);
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().used_dirs_count,
+        descriptor.used_dirs_count + 1
+    );
+
+    filesystem.free_inode(inode, false).unwrap();
+    filesystem.free_inode(directory, true).unwrap();
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes);
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().used_dirs_count,
+        descriptor.used_dirs_count
+    );
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().free_blocks_count,
+        descriptor.free_blocks_count
+    );
+}
+
+#[test]
+fn allocation_round_trips_through_the_device() {
+    let mut filesystem = fresh_rw();
+    let block = filesystem.allocate_block(0).unwrap();
+    let inode = filesystem.allocate_inode(0, false).unwrap();
+    let free_blocks = filesystem.superblock().free_blocks_count();
+    let free_inodes = filesystem.superblock().free_inodes_count();
+    filesystem.sync().unwrap();
+    let data = filesystem.into_device().into_data();
+
+    let mut reopened = Ext2::mount_rw_with_clock(RamDisk::new(data), || 1_700_000_000).unwrap();
+    assert_eq!(reopened.superblock().free_blocks_count(), free_blocks);
+    assert_eq!(reopened.superblock().free_inodes_count(), free_inodes);
+    assert!(reopened.is_block_allocated(block).unwrap());
+    assert!(reopened.is_inode_allocated(inode).unwrap());
+
+    reopened.free_block(block).unwrap();
+    reopened.free_inode(inode, false).unwrap();
+    reopened.sync().unwrap();
+    let data = reopened.into_device().into_data();
+
+    let mut reopened = Ext2::mount_rw_with_clock(RamDisk::new(data), || 1_700_000_000).unwrap();
+    assert!(!reopened.is_block_allocated(block).unwrap());
+    assert!(!reopened.is_inode_allocated(inode).unwrap());
+}
+
+#[test]
+fn synced_allocator_state_passes_e2fsck() {
+    let mut filesystem = fresh_rw();
+    let blocks: Vec<u32> = (0..4)
+        .map(|_| filesystem.allocate_block(0).unwrap())
+        .collect();
+    let inodes: Vec<u32> = (0..3)
+        .map(|_| filesystem.allocate_inode(0, false).unwrap())
+        .collect();
+    for block in &blocks {
+        filesystem.free_block(*block).unwrap();
+    }
+    for inode in &inodes {
+        filesystem.free_inode(*inode, false).unwrap();
+    }
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    assert!(disk.flushes() > 0);
+    e2fsck(disk.data());
+}
+
+#[test]
+fn device_write_failures_are_reported() {
+    let mut filesystem = fresh_rw();
+    filesystem.device_mut().set_fail_writes(true);
+    assert_eq!(filesystem.allocate_block(0), Err(Ext2Error::Device));
+}
+
+#[test]
+fn allocates_on_four_kib_blocks_and_256_byte_inodes() {
+    let data = build_minimal_image("4096", "256", "8192");
+    let mut filesystem = Ext2::mount_rw_with_clock(RamDisk::new(data), || 1_700_000_000).unwrap();
+    assert_eq!(filesystem.superblock().block_size(), 4096);
+    assert_eq!(filesystem.superblock().inode_size(), 256);
+
+    let block = filesystem.allocate_block(0).unwrap();
+    let inode = filesystem.allocate_inode(0, true).unwrap();
+    assert!(filesystem.is_block_allocated(block).unwrap());
+    assert!(filesystem.is_inode_allocated(inode).unwrap());
+    filesystem.free_block(block).unwrap();
+    filesystem.free_inode(inode, true).unwrap();
+    filesystem.sync().unwrap();
+
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
 }
