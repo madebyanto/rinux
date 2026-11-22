@@ -13,15 +13,40 @@ fn initializes_standard_file_descriptors() {
 #[test]
 fn allocates_lowest_free_file_descriptor_and_reuses_closed() {
     let mut table = FdTable::new();
-    assert_eq!(table.open_file(2), Ok(3));
-    assert_eq!(table.open_file(5), Ok(4));
+    assert_eq!(table.open_file(2, 0), Ok(3));
+    assert_eq!(table.open_file(5, 0), Ok(4));
     assert_eq!(
         table.entry(3),
-        Ok(FdEntry::File(File { node: 2, offset: 0 }))
+        Ok(FdEntry::File(File {
+            node: 2,
+            offset: 0,
+            flags: 0
+        }))
     );
     table.close(3).unwrap();
-    assert_eq!(table.open_file(9), Ok(3));
-    assert_eq!(table.entry(4), Ok(FdEntry::File(File { node: 5, offset: 0 })));
+    assert_eq!(table.open_file(9, 0), Ok(3));
+    assert_eq!(
+        table.entry(4),
+        Ok(FdEntry::File(File {
+            node: 5,
+            offset: 0,
+            flags: 0
+        }))
+    );
+}
+
+#[test]
+fn preserves_open_flags_on_file_descriptors() {
+    let mut table = FdTable::new();
+    let fd = table.open_file(8, 0o2001).unwrap();
+    assert_eq!(
+        table.entry(fd),
+        Ok(FdEntry::File(File {
+            node: 8,
+            offset: 0,
+            flags: 0o2001
+        }))
+    );
 }
 
 #[test]
@@ -30,11 +55,15 @@ fn updates_offsets_and_rejects_invalid_descriptors() {
     assert_eq!(table.set_offset(0, 10), Err(hosttest::fs::fd::FdError::InvalidFd));
     assert_eq!(table.close(0), Err(hosttest::fs::fd::FdError::InvalidFd));
     assert_eq!(table.close(MAX_FDS as u32), Err(hosttest::fs::fd::FdError::InvalidFd));
-    let fd = table.open_file(7).unwrap();
+    let fd = table.open_file(7, 0).unwrap();
     table.set_offset(fd, 42).unwrap();
     assert_eq!(
         table.entry(fd),
-        Ok(FdEntry::File(File { node: 7, offset: 42 }))
+        Ok(FdEntry::File(File {
+            node: 7,
+            offset: 42,
+            flags: 0
+        }))
     );
     assert!(table.close(fd).is_ok());
     assert_eq!(table.entry(fd), Err(hosttest::fs::fd::FdError::InvalidFd));
@@ -44,12 +73,12 @@ fn updates_offsets_and_rejects_invalid_descriptors() {
 fn reports_no_free_descriptor() {
     let mut table = FdTable::new();
     for _ in 3..MAX_FDS {
-        table.open_file(2).unwrap();
+        table.open_file(2, 0).unwrap();
     }
     assert_eq!(
-        table.open_file(2),
+        table.open_file(2, 0),
         Err(hosttest::fs::fd::FdError::NoFreeFd)
     );
     table.close(3).unwrap();
-    assert_eq!(table.open_file(2), Ok(3));
+    assert_eq!(table.open_file(2, 0), Ok(3));
 }

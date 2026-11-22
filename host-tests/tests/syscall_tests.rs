@@ -1,10 +1,12 @@
 use core::mem::size_of;
 
 use hosttest::syscall_abi::{
-    classify, errno, KernelSigAction, Syscall, E2BIG, EBADF, ECHILD, EFAULT, EINTR, EINVAL,
-    ENOMEM, ENOSYS, ENOENT, EPERM, EROFS, ESRCH, SIGSET_SIZE, SYS_CLOSE, SYS_EXECVE, SYS_EXIT,
-    SYS_FORK, SYS_GETPID, SYS_KILL, SYS_LSEEK, SYS_OPEN, SYS_READ, SYS_RT_SIGACTION,
-    SYS_RT_SIGPROCMASK, SYS_RT_SIGRETURN, SYS_STAT, SYS_WAITPID, SYS_WRITE,
+    classify, errno, validate_open_flags, KernelSigAction, OpenAccess, Syscall, E2BIG, EBADF,
+    ECHILD, EFAULT, EINTR, EINVAL, ENOMEM, ENOSYS, ENOENT, EPERM, EROFS, ESRCH, O_ACCMODE,
+    O_APPEND, O_CLOEXEC, O_CREAT, O_DSYNC, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC,
+    O_TRUNC, O_WRONLY, SIGSET_SIZE, SYS_CLOSE, SYS_EXECVE, SYS_EXIT, SYS_FORK, SYS_FTRUNCATE,
+    SYS_GETPID, SYS_KILL, SYS_LSEEK, SYS_OPEN, SYS_READ, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK,
+    SYS_RT_SIGRETURN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_WAITPID, SYS_WRITE,
 };
 
 #[test]
@@ -23,7 +25,43 @@ fn classifies_linux_syscall_numbers() {
     assert_eq!(classify(SYS_WAITPID), Some(Syscall::WaitPid));
     assert_eq!(classify(SYS_KILL), Some(Syscall::Kill));
     assert_eq!(classify(SYS_GETPID), Some(Syscall::GetPid));
+    assert_eq!(classify(SYS_TRUNCATE), Some(Syscall::Truncate));
+    assert_eq!(classify(SYS_FTRUNCATE), Some(Syscall::Ftruncate));
+    assert_eq!(classify(SYS_SYNC), Some(Syscall::Sync));
     assert_eq!(classify(SYS_EXIT), Some(Syscall::Exit));
+}
+
+#[test]
+fn validates_open_flags_and_access_modes() {
+    assert_eq!(validate_open_flags(O_RDONLY), Some(OpenAccess::ReadOnly));
+    assert_eq!(validate_open_flags(O_WRONLY), Some(OpenAccess::WriteOnly));
+    assert_eq!(validate_open_flags(O_RDWR), Some(OpenAccess::ReadWrite));
+    assert_eq!(validate_open_flags(O_ACCMODE), None);
+    assert_eq!(validate_open_flags(0o200000), None);
+
+    let flags = O_RDWR | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_CLOEXEC | O_NONBLOCK;
+    assert_eq!(validate_open_flags(flags), Some(OpenAccess::ReadWrite));
+    assert_eq!(
+        validate_open_flags(O_WRONLY | O_APPEND),
+        Some(OpenAccess::WriteOnly)
+    );
+    assert_eq!(
+        validate_open_flags(O_RDWR | O_SYNC | O_DSYNC),
+        Some(OpenAccess::ReadWrite)
+    );
+    assert!(OpenAccess::ReadOnly.readable());
+    assert!(!OpenAccess::ReadOnly.writable());
+    assert!(OpenAccess::WriteOnly.writable());
+    assert!(OpenAccess::ReadWrite.readable() && OpenAccess::ReadWrite.writable());
+}
+
+#[test]
+fn truncate_and_sync_use_linux_numbers() {
+    assert_eq!(SYS_TRUNCATE, 76);
+    assert_eq!(SYS_FTRUNCATE, 77);
+    assert_eq!(SYS_SYNC, 162);
+    assert_eq!(O_TRUNC, 0o1000);
+    assert_eq!(O_APPEND, 0o2000);
 }
 
 #[test]

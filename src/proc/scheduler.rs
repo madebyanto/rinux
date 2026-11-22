@@ -972,13 +972,13 @@ pub fn current_fd_entry(fd: u32) -> Result<FdEntry, FdError> {
     })
 }
 
-pub fn current_open_fd(node: u32) -> Result<u32, FdError> {
+pub fn current_open_fd(node: u32, flags: u32) -> Result<u32, FdError> {
     cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         let scheduler = guard.as_mut().ok_or(FdError::NoProcess)?;
         let pid = scheduler.current.ok_or(FdError::NoProcess)?;
         let process = scheduler.process_mut(pid).ok_or(FdError::NoProcess)?;
-        process.fds.open_file(node)
+        process.fds.open_file(node, flags)
     })
 }
 

@@ -74,6 +74,9 @@ fn dispatch(frame: &mut SyscallFrame) -> u64 {
         Some(abi::Syscall::Execve) => sys_execve(frame, arg0, arg1, arg2),
         Some(abi::Syscall::WaitPid) => sys_waitpid(arg0, arg1, arg2),
         Some(abi::Syscall::Kill) => sys_kill(arg0, arg1),
+        Some(abi::Syscall::Truncate) => sys_truncate(arg0, arg1),
+        Some(abi::Syscall::Ftruncate) => sys_ftruncate(arg0, arg1),
+        Some(abi::Syscall::Sync) => sys_sync(),
         Some(abi::Syscall::Exit) => sys_exit(arg0),
         None => abi::errno(abi::ENOSYS),
     }
@@ -113,6 +116,9 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         }
         FdEntry::Console => abi::errno(abi::EINVAL),
         FdEntry::File(file) => {
+            if file.flags & abi::O_ACCMODE == abi::O_WRONLY {
+                return abi::errno(abi::EBADF);
+            }
             if len == 0 {
                 return 0;
             }
@@ -198,7 +204,45 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
             len as u64
         }
         FdEntry::Keyboard => abi::errno(abi::EBADF),
-        FdEntry::File(_) => abi::errno(abi::EROFS),
+        FdEntry::File(file) => {
+            if file.flags & abi::O_ACCMODE == abi::O_RDONLY {
+                return abi::errno(abi::EBADF);
+            }
+            if len == 0 {
+                return 0;
+            }
+            let len = len as usize;
+            if len > MAX_IO {
+                return abi::errno(abi::EINVAL);
+            }
+            if !uaccess::range_valid(buf as usize, len) {
+                return abi::errno(abi::EFAULT);
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+            if file.flags & abi::O_APPEND != 0 {
+                let (count, end) = match fs::append_node(file.node, bytes) {
+                    Ok(result) => result,
+                    Err(error) => return vfs_errno(error),
+                };
+                if let Err(error) = scheduler::current_set_fd_offset(fd as u32, end) {
+                    return fd_errno(error);
+                }
+                count as u64
+            } else {
+                let count = match fs::write_node(file.node, file.offset, bytes) {
+                    Ok(count) => count,
+                    Err(error) => return vfs_errno(error),
+                };
+                if count > 0 {
+                    if let Err(error) =
+                        scheduler::current_set_fd_offset(fd as u32, file.offset + count as u64)
+                    {
+                        return fd_errno(error);
+                    }
+                }
+                count as u64
+            }
+        }
         FdEntry::Pipe(end) => {
             if len == 0 {
                 return 0;
@@ -244,7 +288,16 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
 }
 
 fn sys_open(path: u64, flags: u64, _mode: u64) -> u64 {
-    if flags != 0 {
+    let flags = flags as u32;
+    let access = match abi::validate_open_flags(flags) {
+        Some(access) => access,
+        None => return abi::errno(abi::EINVAL),
+    };
+    // Directory entry creation arrives with Step 3.
+    if flags & abi::O_CREAT != 0 {
+        return abi::errno(abi::ENOENT);
+    }
+    if flags & abi::O_TRUNC != 0 && !access.writable() {
         return abi::errno(abi::EACCES);
     }
     let path = match user_path(path) {
@@ -255,7 +308,19 @@ fn sys_open(path: u64, flags: u64, _mode: u64) -> u64 {
         Ok(file) => file,
         Err(error) => return vfs_errno(error),
     };
-    match scheduler::current_open_fd(file.node) {
+    if flags & abi::O_TRUNC != 0 {
+        let stat = match fs::stat_node(file.node) {
+            Ok(stat) => stat,
+            Err(error) => return vfs_errno(error),
+        };
+        if stat.kind != FileType::Regular {
+            return abi::errno(abi::EISDIR);
+        }
+        if let Err(error) = fs::truncate_node(file.node, 0) {
+            return vfs_errno(error);
+        }
+    }
+    match scheduler::current_open_fd(file.node, flags) {
         Ok(fd) => fd as u64,
         Err(error) => fd_errno(error),
     }
@@ -309,6 +374,45 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     match scheduler::current_set_fd_offset(fd as u32, new_offset) {
         Ok(()) => new_offset,
         Err(error) => fd_errno(error),
+    }
+}
+
+fn sys_truncate(path: u64, length: u64) -> u64 {
+    if (length as i64) < 0 {
+        return abi::errno(abi::EINVAL);
+    }
+    let path = match user_path(path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match fs::truncate_path(&path, length) {
+        Ok(()) => 0,
+        Err(error) => vfs_errno(error),
+    }
+}
+
+fn sys_ftruncate(fd: u64, length: u64) -> u64 {
+    if (length as i64) < 0 {
+        return abi::errno(abi::EINVAL);
+    }
+    let file = match scheduler::current_fd_entry(fd as u32) {
+        Ok(FdEntry::File(file)) => file,
+        Ok(_) => return abi::errno(abi::EBADF),
+        Err(error) => return fd_errno(error),
+    };
+    if file.flags & abi::O_ACCMODE == abi::O_RDONLY {
+        return abi::errno(abi::EINVAL);
+    }
+    match fs::truncate_node(file.node, length) {
+        Ok(()) => 0,
+        Err(error) => vfs_errno(error),
+    }
+}
+
+fn sys_sync() -> u64 {
+    match fs::sync() {
+        Ok(()) => 0,
+        Err(error) => vfs_errno(error),
     }
 }
 
@@ -768,5 +872,8 @@ fn vfs_errno(error: VfsError) -> u64 {
         VfsError::Corrupt => abi::errno(abi::EIO),
         VfsError::Device => abi::errno(abi::EIO),
         VfsError::Unsupported => abi::errno(abi::EINVAL),
+        VfsError::ReadOnly => abi::errno(abi::EROFS),
+        VfsError::NoSpace => abi::errno(abi::ENOSPC),
+        VfsError::FileTooLarge => abi::errno(abi::EFBIG),
     }
 }

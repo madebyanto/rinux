@@ -37,3 +37,7 @@ pub fn block_path(logical: u64, pointers: u64) -> BlockPath {
 pub(crate) fn read_pointer(data: &[u8], index: usize) -> u32 {
     u32_at(data, index * 4)
 }
+
+pub(crate) fn write_pointer(data: &mut [u8], index: usize, block: u32) {
+    data[index * 4..index * 4 + 4].copy_from_slice(&block.to_le_bytes());
+}

@@ -109,8 +109,8 @@ impl FdTable {
         Err(FdError::NoFreeFd)
     }
 
-    pub fn open_file(&mut self, node: NodeId) -> Result<u32, FdError> {
-        self.install(FdEntry::File(File::new(node)))
+    pub fn open_file(&mut self, node: NodeId, flags: u32) -> Result<u32, FdError> {
+        self.install(FdEntry::File(File::with_flags(node, flags)))
     }
 
     /// Number of descriptors that can still be allocated.

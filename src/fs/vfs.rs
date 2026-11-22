@@ -44,11 +44,24 @@ impl DirCursor {
 pub struct File {
     pub node: NodeId,
     pub offset: u64,
+    pub flags: u32,
 }
 
 impl File {
     pub const fn new(node: NodeId) -> Self {
-        Self { node, offset: 0 }
+        Self {
+            node,
+            offset: 0,
+            flags: 0,
+        }
+    }
+
+    pub const fn with_flags(node: NodeId, flags: u32) -> Self {
+        Self {
+            node,
+            offset: 0,
+            flags,
+        }
     }
 }
 
@@ -63,17 +76,26 @@ pub enum VfsError {
     Corrupt,
     Device,
     Unsupported,
+    ReadOnly,
+    NoSpace,
+    FileTooLarge,
 }
 
 pub trait FileSystem: Send {
     fn open(&mut self, path: &str) -> Result<NodeId, VfsError>;
     fn stat(&mut self, node: NodeId) -> Result<Stat, VfsError>;
     fn read(&mut self, node: NodeId, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError>;
+    fn write(&mut self, node: NodeId, offset: u64, buffer: &[u8]) -> Result<usize, VfsError>;
+    fn truncate(&mut self, node: NodeId, size: u64) -> Result<(), VfsError>;
     fn readdir(
         &mut self,
         node: NodeId,
         cursor: &mut DirCursor,
     ) -> Result<Option<DirEntry>, VfsError>;
+
+    fn sync(&mut self) -> Result<(), VfsError> {
+        Ok(())
+    }
 }
 
 pub struct Vfs {
@@ -96,6 +118,10 @@ impl Vfs {
 
     pub fn stat(&mut self, path: &str) -> Result<Stat, VfsError> {
         let node = self.root.open(path)?;
+        self.root.stat(node)
+    }
+
+    pub fn stat_node(&mut self, node: NodeId) -> Result<Stat, VfsError> {
         self.root.stat(node)
     }
 
@@ -122,6 +148,51 @@ impl Vfs {
         let count = self.read_at(file.node, file.offset, buffer)?;
         file.offset += count as u64;
         Ok(count)
+    }
+
+    pub fn write_at(
+        &mut self,
+        node: NodeId,
+        offset: u64,
+        buffer: &[u8],
+    ) -> Result<usize, VfsError> {
+        let stat = self.root.stat(node)?;
+        if stat.kind != FileType::Regular {
+            return Err(VfsError::NotFile);
+        }
+        self.root.write(node, offset, buffer)
+    }
+
+    #[allow(dead_code)]
+    pub fn write(&mut self, file: &mut File, buffer: &[u8]) -> Result<usize, VfsError> {
+        let count = self.write_at(file.node, file.offset, buffer)?;
+        file.offset += count as u64;
+        Ok(count)
+    }
+
+    /// Append atomically with respect to other VFS writers and return the new
+    /// end offset.
+    pub fn append(&mut self, file: &mut File, buffer: &[u8]) -> Result<(usize, u64), VfsError> {
+        let stat = self.root.stat(file.node)?;
+        if stat.kind != FileType::Regular {
+            return Err(VfsError::NotFile);
+        }
+        let count = self.root.write(file.node, stat.size, buffer)?;
+        let end = stat.size + count as u64;
+        file.offset = end;
+        Ok((count, end))
+    }
+
+    pub fn truncate(&mut self, node: NodeId, size: u64) -> Result<(), VfsError> {
+        let stat = self.root.stat(node)?;
+        if stat.kind != FileType::Regular {
+            return Err(VfsError::NotFile);
+        }
+        self.root.truncate(node, size)
+    }
+
+    pub fn sync(&mut self) -> Result<(), VfsError> {
+        self.root.sync()
     }
 
     pub fn readdir(
@@ -160,6 +231,9 @@ impl core::fmt::Display for VfsError {
             VfsError::Corrupt => write!(formatter, "corrupt filesystem"),
             VfsError::Device => write!(formatter, "block device error"),
             VfsError::Unsupported => write!(formatter, "unsupported filesystem feature"),
+            VfsError::ReadOnly => write!(formatter, "filesystem is read-only"),
+            VfsError::NoSpace => write!(formatter, "no space left on device"),
+            VfsError::FileTooLarge => write!(formatter, "file too large"),
         }
     }
 }

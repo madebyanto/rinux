@@ -610,6 +610,232 @@ fn device_write_failures_are_reported() {
 }
 
 #[test]
+fn writes_across_direct_singly_and_doubly_indirect_blocks() {
+    let mut filesystem = fresh_rw();
+    let node = filesystem.lookup("/hello.txt").unwrap();
+    let data: Vec<u8> = (0..300 * 1024).map(pattern).collect();
+    assert_eq!(filesystem.write_file(node, 0, &data).unwrap(), data.len());
+    assert_eq!(filesystem.stat_inode(node).unwrap().size, data.len() as u64);
+
+    for offset in [
+        0usize,
+        11 * 1024,
+        12 * 1024,
+        12 * 1024 + 256 * 1024 - 1,
+        12 * 1024 + 256 * 1024,
+        300 * 1024 - 64,
+    ] {
+        let mut buffer = [0u8; 64];
+        let count = filesystem
+            .read_file(node, offset as u64, &mut buffer)
+            .unwrap();
+        for index in 0..count {
+            assert_eq!(
+                buffer[index],
+                data[offset + index],
+                "offset {}",
+                offset + index
+            );
+        }
+    }
+
+    let patch = vec![0xAB; 50 * 1024];
+    let offset = 100 * 1024;
+    assert_eq!(
+        filesystem.write_file(node, offset as u64, &patch).unwrap(),
+        patch.len()
+    );
+    let mut buffer = vec![0u8; patch.len()];
+    let count = filesystem
+        .read_file(node, offset as u64, &mut buffer)
+        .unwrap();
+    assert_eq!(&buffer[..count], &patch[..]);
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn truncating_a_large_file_frees_indirect_trees() {
+    let mut filesystem = fresh_rw();
+    let node = filesystem.lookup("/hello.txt").unwrap();
+    let data: Vec<u8> = (0..300 * 1024).map(pattern).collect();
+    filesystem.write_file(node, 0, &data).unwrap();
+    let free_before = filesystem.superblock().free_blocks_count();
+
+    filesystem.truncate_inode(node, 1000).unwrap();
+    assert_eq!(filesystem.stat_inode(node).unwrap().size, 1000);
+    assert!(
+        filesystem.superblock().free_blocks_count() > free_before + 250,
+        "expected the indirect trees to be freed"
+    );
+
+    let mut buffer = [0u8; 64];
+    let count = filesystem.read_file(node, 900, &mut buffer).unwrap();
+    assert_eq!(count, 64);
+    for index in 0..count {
+        assert_eq!(buffer[index], data[900 + index]);
+    }
+    assert_eq!(filesystem.read_file(node, 1000, &mut buffer).unwrap(), 0);
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn sparse_writes_leave_zero_holes() {
+    let mut filesystem = fresh_rw();
+    let node = filesystem.lookup("/hello.txt").unwrap();
+    let old_size = filesystem.stat_inode(node).unwrap().size;
+    let offset = 300 * 1024 + 500;
+    let payload = b"sparse tail";
+    assert_eq!(
+        filesystem.write_file(node, offset, payload).unwrap(),
+        payload.len()
+    );
+    assert_eq!(
+        filesystem.stat_inode(node).unwrap().size,
+        offset + payload.len() as u64
+    );
+
+    // The gap right after the old end reads as zeros.
+    let mut buffer = [0u8; 64];
+    let count = filesystem.read_file(node, old_size, &mut buffer).unwrap();
+    assert_eq!(count, 64);
+    assert!(buffer.iter().all(|byte| *byte == 0));
+
+    // The bytes just before the payload are part of the hole.
+    let count = filesystem
+        .read_file(node, offset - 32, &mut buffer)
+        .unwrap();
+    assert_eq!(count, 32 + payload.len());
+    assert!(buffer[..32].iter().all(|byte| *byte == 0));
+    assert_eq!(&buffer[32..32 + payload.len()], payload);
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn partial_write_commits_prefix_when_space_runs_out() {
+    let data = build_minimal_image("1024", "128", "256");
+    let mut filesystem = Ext2::mount_rw_with_clock(RamDisk::new(data), || 1_700_000_000).unwrap();
+    let node = filesystem.lookup("/hello.txt").unwrap();
+    let free = filesystem.superblock().free_blocks_count() as usize;
+    let payload: Vec<u8> = (0..(free + 8) * 1024).map(pattern).collect();
+    let written = filesystem.write_file(node, 0, &payload).unwrap();
+    assert!(written > 0, "expected a partial write");
+    assert!(written < payload.len(), "expected the write to stop early");
+    assert_eq!(
+        filesystem.stat_inode(node).unwrap().size,
+        written as u64
+    );
+
+    let mut buffer = vec![0u8; written];
+    let count = filesystem.read_file(node, 0, &mut buffer).unwrap();
+    assert_eq!(count, written);
+    assert_eq!(buffer, payload[..written]);
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn truncate_shrinks_and_grows_with_zero_fill() {
+    let mut filesystem = fresh_rw();
+    let node = filesystem.lookup("/hello.txt").unwrap();
+    let data = vec![0x5A; 5000];
+    assert_eq!(filesystem.write_file(node, 0, &data).unwrap(), data.len());
+
+    let free_before = filesystem.superblock().free_blocks_count();
+    filesystem.truncate_inode(node, 1500).unwrap();
+    assert_eq!(filesystem.stat_inode(node).unwrap().size, 1500);
+    assert!(filesystem.superblock().free_blocks_count() > free_before);
+
+    let mut buffer = [0u8; 64];
+    let count = filesystem.read_file(node, 1440, &mut buffer).unwrap();
+    assert_eq!(count, 60);
+    assert!(buffer[..count].iter().all(|byte| *byte == 0x5A));
+    assert_eq!(filesystem.read_file(node, 1500, &mut buffer).unwrap(), 0);
+
+    filesystem.truncate_inode(node, 3000).unwrap();
+    assert_eq!(filesystem.stat_inode(node).unwrap().size, 3000);
+    let count = filesystem.read_file(node, 1500, &mut buffer).unwrap();
+    assert_eq!(count, 64);
+    assert!(buffer.iter().all(|byte| *byte == 0));
+    let count = filesystem.read_file(node, 2990, &mut buffer).unwrap();
+    assert_eq!(count, 10);
+    assert!(buffer[..count].iter().all(|byte| *byte == 0));
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn vfs_write_append_and_truncate_follow_open_semantics() {
+    let mut vfs = Vfs::new(Box::new(fresh_rw()));
+    let mut file = vfs.open("/hello.txt").unwrap();
+    assert_eq!(vfs.write(&mut file, b"abc").unwrap(), 3);
+    assert_eq!(file.offset, 3);
+
+    let size = vfs.stat("/hello.txt").unwrap().size;
+    let mut appending = vfs.open("/hello.txt").unwrap();
+    appending.offset = 1;
+    let (count, end) = vfs.append(&mut appending, b"XYZ").unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(end, size + 3);
+    assert_eq!(appending.offset, end);
+
+    // O_TRUNC truncates before the descriptor starts using the file.
+    vfs.truncate(file.node, 0).unwrap();
+    assert_eq!(vfs.stat("/hello.txt").unwrap().size, 0);
+    let (count, end) = vfs.append(&mut appending, b"fresh").unwrap();
+    assert_eq!((count, end), (5, 5));
+    let mut buffer = [0u8; 8];
+    let count = vfs.read_at(file.node, 0, &mut buffer).unwrap();
+    assert_eq!(&buffer[..count], b"fresh");
+}
+
+#[test]
+fn writes_and_truncates_on_four_kib_blocks() {
+    let data = build_minimal_image("4096", "256", "8192");
+    let mut filesystem = Ext2::mount_rw_with_clock(RamDisk::new(data), || 1_700_000_000).unwrap();
+    let node = filesystem.lookup("/hello.txt").unwrap();
+    let payload: Vec<u8> = (0..200 * 1024).map(pattern).collect();
+    assert_eq!(
+        filesystem.write_file(node, 0, &payload).unwrap(),
+        payload.len()
+    );
+    assert_eq!(
+        filesystem.stat_inode(node).unwrap().size,
+        payload.len() as u64
+    );
+
+    let mut buffer = [0u8; 128];
+    let count = filesystem
+        .read_file(node, 200 * 1024 - 64, &mut buffer)
+        .unwrap();
+    assert_eq!(count, 64);
+    for index in 0..count {
+        assert_eq!(buffer[index], payload[200 * 1024 - 64 + index]);
+    }
+
+    filesystem.truncate_inode(node, 50 * 1024).unwrap();
+    assert_eq!(
+        filesystem.stat_inode(node).unwrap().size,
+        50 * 1024
+    );
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
 fn allocates_on_four_kib_blocks_and_256_byte_inodes() {
     let data = build_minimal_image("4096", "256", "8192");
     let mut filesystem = Ext2::mount_rw_with_clock(RamDisk::new(data), || 1_700_000_000).unwrap();

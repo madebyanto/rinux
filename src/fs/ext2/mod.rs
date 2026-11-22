@@ -13,7 +13,7 @@ use ::alloc::string::String;
 use ::alloc::vec;
 use ::alloc::vec::Vec;
 use bitmap::Bitmap;
-use inode::read_pointer;
+use inode::{read_pointer, write_pointer};
 use structs::{
     parse_inode, Inode, GROUP_DESCRIPTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE, VALID_FS,
 };
@@ -27,6 +27,7 @@ pub enum Ext2Error {
     Device,
     ReadOnly,
     NoSpace,
+    FileTooLarge,
     BadMagic(u16),
     BadSuperblock,
     UnsupportedFeature {
@@ -54,6 +55,7 @@ impl core::fmt::Display for Ext2Error {
             Ext2Error::Device => write!(formatter, "block device error"),
             Ext2Error::ReadOnly => write!(formatter, "filesystem is mounted read-only"),
             Ext2Error::NoSpace => write!(formatter, "no space left on device"),
+            Ext2Error::FileTooLarge => write!(formatter, "file too large"),
             Ext2Error::BadMagic(magic) => write!(formatter, "bad ext2 magic {:#x}", magic),
             Ext2Error::BadSuperblock => write!(formatter, "invalid ext2 superblock"),
             Ext2Error::UnsupportedFeature {
@@ -91,7 +93,9 @@ impl From<Ext2Error> for VfsError {
     fn from(error: Ext2Error) -> Self {
         match error {
             Ext2Error::Device => VfsError::Device,
-            Ext2Error::ReadOnly | Ext2Error::NoSpace => VfsError::Unsupported,
+            Ext2Error::ReadOnly => VfsError::ReadOnly,
+            Ext2Error::NoSpace => VfsError::NoSpace,
+            Ext2Error::FileTooLarge => VfsError::FileTooLarge,
             Ext2Error::NotFound => VfsError::NotFound,
             Ext2Error::NotDirectory => VfsError::NotDirectory,
             Ext2Error::NotFile => VfsError::NotFile,
@@ -226,6 +230,15 @@ impl BlockCache {
     fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
     }
+}
+
+/// A block allocated while resolving a logical block, recorded so a failed
+/// allocation can undo every pointer and free the block again.
+enum Allocation {
+    /// Pointer lives in the inode's `i_block` array at the given index.
+    Inode(usize, u32),
+    /// Pointer lives in an indirect block at `(block, index)`.
+    Parent(u32, usize, u32),
 }
 
 pub struct Ext2<D: BlockDevice> {
@@ -633,6 +646,449 @@ impl<D: BlockDevice> Ext2<D> {
         Ok(done)
     }
 
+    /// Write `buffer` at `offset`, allocating blocks as needed.
+    ///
+    /// A partial write commits the bytes already written when the allocator
+    /// runs out of space, which matches the usual short-write semantics.
+    pub fn write_file(
+        &mut self,
+        node: NodeId,
+        offset: u64,
+        buffer: &[u8],
+    ) -> Result<usize, Ext2Error> {
+        self.require_writable()?;
+        let mut inode = self.read_inode(node)?;
+        if inode.kind() != FileType::Regular {
+            return Err(Ext2Error::NotFile);
+        }
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let block_size = self.superblock.block_size();
+        let old_size = inode.size;
+        let large_file = self.superblock.has_large_file();
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or(Ext2Error::FileTooLarge)?;
+        if end > self.max_file_size(&inode) {
+            return Err(Ext2Error::FileTooLarge);
+        }
+        // A write past the old end leaves a hole. Zero the stale tail of the
+        // old last block so the gap reads back as zeros.
+        if offset > old_size {
+            let old_last = old_size / block_size as u64;
+            let old_within = (old_size % block_size as u64) as usize;
+            if old_within != 0 {
+                let disk = self.map_block(&inode, old_last)?;
+                if disk != 0 {
+                    let mut data = self.read_block_vec(disk as u64)?;
+                    data[old_within..].fill(0);
+                    self.write_block(disk as u64, &data)?;
+                }
+            }
+        }
+        let mut done = 0usize;
+        let mut failure: Option<Ext2Error> = None;
+        while done < buffer.len() {
+            let current = offset + done as u64;
+            let logical = current / block_size as u64;
+            let within = (current % block_size as u64) as usize;
+            let chunk = (block_size - within).min(buffer.len() - done);
+            let disk = match self.ensure_block(&mut inode, logical) {
+                Ok(block) => block,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            let extending = current + chunk as u64 > old_size;
+            if within == 0 && chunk == block_size {
+                self.write_block(disk as u64, &buffer[done..done + chunk])?;
+            } else {
+                let mut data = self.read_block_vec(disk as u64)?;
+                if current > old_size {
+                    let hole_start = if old_size / block_size as u64 == logical {
+                        (old_size % block_size as u64) as usize
+                    } else {
+                        0
+                    };
+                    if hole_start < within {
+                        data[hole_start..within].fill(0);
+                    }
+                }
+                data[within..within + chunk].copy_from_slice(&buffer[done..done + chunk]);
+                // Extending the file leaves a zero-filled tail in its last
+                // partial block, so later reads never expose stale bytes.
+                if done + chunk == buffer.len() && extending && within + chunk < block_size {
+                    data[within + chunk..].fill(0);
+                }
+                self.write_block(disk as u64, &data)?;
+            }
+            done += chunk;
+        }
+        let new_size = (offset + done as u64).max(old_size);
+        if done > 0 || new_size != old_size {
+            inode.set_size(new_size, large_file)?;
+            let now = self.now();
+            inode.set_mtime(now);
+            inode.set_ctime(now);
+            self.write_inode(&mut inode)?;
+        }
+        match failure {
+            Some(error) if done == 0 => Err(error),
+            Some(_) => Ok(done),
+            None => Ok(done),
+        }
+    }
+
+    /// Change a regular file's size, zeroing the new tail when shrinking and
+    /// leaving sparse holes when growing.
+    pub fn truncate_inode(&mut self, node: NodeId, new_size: u64) -> Result<(), Ext2Error> {
+        self.require_writable()?;
+        let mut inode = self.read_inode(node)?;
+        if inode.kind() != FileType::Regular {
+            return Err(Ext2Error::NotFile);
+        }
+        let block_size = self.superblock.block_size();
+        let large_file = self.superblock.has_large_file();
+        if new_size > self.max_file_size(&inode) {
+            return Err(Ext2Error::FileTooLarge);
+        }
+        let old_size = inode.size;
+        if new_size > old_size {
+            let old_last = old_size / block_size as u64;
+            let old_within = (old_size % block_size as u64) as usize;
+            if old_within != 0 {
+                let disk = self.map_block(&inode, old_last)?;
+                if disk != 0 {
+                    let mut data = self.read_block_vec(disk as u64)?;
+                    let end = if new_size / block_size as u64 == old_last {
+                        (new_size % block_size as u64) as usize
+                    } else {
+                        block_size
+                    };
+                    data[old_within..end].fill(0);
+                    self.write_block(disk as u64, &data)?;
+                }
+            }
+        } else if new_size < old_size {
+            let new_last = new_size / block_size as u64;
+            let within = (new_size % block_size as u64) as usize;
+            if within != 0 {
+                let disk = self.map_block(&inode, new_last)?;
+                if disk != 0 {
+                    let mut data = self.read_block_vec(disk as u64)?;
+                    data[within..].fill(0);
+                    self.write_block(disk as u64, &data)?;
+                }
+            }
+            let start_logical = (new_size + block_size as u64 - 1) / block_size as u64;
+            self.free_blocks_from(&mut inode, start_logical)?;
+        }
+        inode.set_size(new_size, large_file)?;
+        let now = self.now();
+        inode.set_mtime(now);
+        inode.set_ctime(now);
+        self.write_inode(&mut inode)
+    }
+
+    /// Free every data and indirect block at or after `start_logical`.
+    fn free_blocks_from(
+        &mut self,
+        inode: &mut Inode,
+        start_logical: u64,
+    ) -> Result<(), Ext2Error> {
+        self.require_writable()?;
+        let block_size = self.superblock.block_size();
+        let pointers = (block_size / 4) as u64;
+        let sectors = self.sectors_per_block();
+        let mut freed = 0u64;
+        if start_logical < 12 {
+            for index in start_logical as usize..12 {
+                let block = inode.block(index);
+                if block != 0 {
+                    self.free_block(block)?;
+                    inode.set_block(index, 0);
+                    freed += 1;
+                }
+            }
+        }
+        let singly_start = 12u64;
+        let singly_end = singly_start + pointers;
+        let doubly_end = singly_end + pointers * pointers;
+        let triply_end = doubly_end + pointers * pointers * pointers;
+        if start_logical < singly_end {
+            let block = inode.block(12);
+            if block != 0 {
+                let count = if start_logical <= singly_start {
+                    self.free_indirect_tree(block, 1)?
+                } else {
+                    self.free_indirect_range(block, 1, start_logical - singly_start)?
+                };
+                if start_logical <= singly_start {
+                    inode.set_block(12, 0);
+                }
+                freed += count;
+            }
+        }
+        if start_logical < doubly_end {
+            let block = inode.block(13);
+            if block != 0 {
+                let count = if start_logical <= singly_end {
+                    self.free_indirect_tree(block, 2)?
+                } else {
+                    self.free_indirect_range(block, 2, start_logical - singly_end)?
+                };
+                if start_logical <= singly_end {
+                    inode.set_block(13, 0);
+                }
+                freed += count;
+            }
+        }
+        if start_logical < triply_end {
+            let block = inode.block(14);
+            if block != 0 {
+                let count = if start_logical <= doubly_end {
+                    self.free_indirect_tree(block, 3)?
+                } else {
+                    self.free_indirect_range(block, 3, start_logical - doubly_end)?
+                };
+                if start_logical <= doubly_end {
+                    inode.set_block(14, 0);
+                }
+                freed += count;
+            }
+        }
+        if freed != 0 {
+            let sectors_freed = freed
+                .saturating_mul(sectors as u64)
+                .min(u32::MAX as u64) as u32;
+            inode.sub_sectors(sectors_freed);
+        }
+        Ok(())
+    }
+
+    fn max_file_size(&self, inode: &Inode) -> u64 {
+        let block_size = self.superblock.block_size() as u64;
+        let pointers = (self.superblock.block_size() / 4) as u64;
+        let total = 12u64
+            .saturating_add(pointers)
+            .saturating_add(pointers.saturating_mul(pointers))
+            .saturating_add(
+                pointers
+                    .saturating_mul(pointers)
+                    .saturating_mul(pointers),
+            );
+        let max = total.saturating_mul(block_size);
+        if inode.kind() == FileType::Regular && self.superblock.has_large_file() {
+            max
+        } else {
+            max.min(u32::MAX as u64)
+        }
+    }
+
+    fn sectors_per_block(&self) -> u32 {
+        (self.superblock.block_size() / 512) as u32
+    }
+
+    /// Return the disk block for `logical`, allocating it (and any missing
+    /// indirect blocks) when necessary.
+    fn ensure_block(&mut self, inode: &mut Inode, logical: u64) -> Result<u32, Ext2Error> {
+        self.require_writable()?;
+        let block_size = self.superblock.block_size();
+        let pointers = (block_size / 4) as u64;
+        let path = block_path(logical, pointers);
+        if path == BlockPath::OutOfRange {
+            return Err(Ext2Error::FileTooLarge);
+        }
+        if !self.superblock.has_large_file()
+            && logical
+                .saturating_add(1)
+                .saturating_mul(block_size as u64)
+                > u32::MAX as u64
+        {
+            return Err(Ext2Error::FileTooLarge);
+        }
+        let group = layout::inode_location(&self.superblock, inode.number)
+            .map(|(group, _)| group as usize)
+            .unwrap_or(0);
+        let sectors = self.sectors_per_block();
+        let mut allocations: Vec<Allocation> = Vec::new();
+        let result = match path {
+            BlockPath::Direct(index) => {
+                let existing = inode.block(index);
+                if existing != 0 {
+                    Ok(existing)
+                } else {
+                    let block = self.allocate_block(group)?;
+                    allocations.push(Allocation::Inode(index, block));
+                    self.zero_block(block)?;
+                    inode.set_block(index, block);
+                    Ok(block)
+                }
+            }
+            BlockPath::Singly(index) => {
+                self.ensure_indirect(inode, 12, &[index], group, &mut allocations)
+            }
+            BlockPath::Doubly(first, second) => {
+                self.ensure_indirect(inode, 13, &[first, second], group, &mut allocations)
+            }
+            BlockPath::Triply(first, second, third) => {
+                self.ensure_indirect(inode, 14, &[first, second, third], group, &mut allocations)
+            }
+            BlockPath::OutOfRange => Err(Ext2Error::FileTooLarge),
+        };
+        match result {
+            Ok(block) => {
+                if !allocations.is_empty() {
+                    inode.add_sectors(sectors.saturating_mul(allocations.len() as u32));
+                }
+                Ok(block)
+            }
+            Err(error) => {
+                self.rollback_allocations(inode, &allocations);
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_indirect(
+        &mut self,
+        inode: &mut Inode,
+        root_index: usize,
+        indices: &[u64],
+        group: usize,
+        allocations: &mut Vec<Allocation>,
+    ) -> Result<u32, Ext2Error> {
+        if inode.block(root_index) == 0 {
+            let block = self.allocate_block(group)?;
+            allocations.push(Allocation::Inode(root_index, block));
+            self.zero_block(block)?;
+            inode.set_block(root_index, block);
+        }
+        let mut current = inode.block(root_index);
+        for (depth, &index) in indices.iter().enumerate() {
+            let last = depth + 1 == indices.len();
+            let mut data = self.read_block_vec(current as u64)?;
+            let child = read_pointer(&data, index as usize);
+            if last {
+                if child != 0 {
+                    return Ok(child);
+                }
+                let block = self.allocate_block(group)?;
+                allocations.push(Allocation::Parent(current, index as usize, block));
+                self.zero_block(block)?;
+                write_pointer(&mut data, index as usize, block);
+                self.write_block(current as u64, &data)?;
+                return Ok(block);
+            }
+            if child == 0 {
+                let block = self.allocate_block(group)?;
+                allocations.push(Allocation::Parent(current, index as usize, block));
+                self.zero_block(block)?;
+                write_pointer(&mut data, index as usize, block);
+                self.write_block(current as u64, &data)?;
+                current = block;
+            } else {
+                current = child;
+            }
+        }
+        Err(Ext2Error::InvalidBlock)
+    }
+
+    fn rollback_allocations(&mut self, inode: &mut Inode, allocations: &[Allocation]) {
+        for allocation in allocations.iter().rev() {
+            match *allocation {
+                Allocation::Inode(index, block) => {
+                    inode.set_block(index, 0);
+                    let _ = self.free_block(block);
+                }
+                Allocation::Parent(parent, index, block) => {
+                    if let Ok(mut data) = self.read_block_vec(parent as u64) {
+                        write_pointer(&mut data, index, 0);
+                        let _ = self.write_block(parent as u64, &data);
+                    }
+                    let _ = self.free_block(block);
+                }
+            }
+        }
+    }
+
+    fn zero_block(&mut self, block: u32) -> Result<(), Ext2Error> {
+        let zeros = vec![0u8; self.superblock.block_size()];
+        self.write_block(block as u64, &zeros)
+    }
+
+    fn free_indirect_tree(&mut self, block: u32, level: u8) -> Result<u64, Ext2Error> {
+        if block == 0 {
+            return Ok(0);
+        }
+        let pointers = (self.superblock.block_size() / 4) as usize;
+        let data = self.read_block_vec(block as u64)?;
+        let mut freed = 0u64;
+        for index in 0..pointers {
+            let child = read_pointer(&data, index);
+            if child == 0 {
+                continue;
+            }
+            if level == 1 {
+                self.free_block(child)?;
+                freed += 1;
+            } else {
+                freed += self.free_indirect_tree(child, level - 1)?;
+            }
+        }
+        self.free_block(block)?;
+        Ok(freed + 1)
+    }
+
+    /// Free entries at or after `start` inside an indirect subtree. The
+    /// subtree root is kept unless `start` is zero.
+    fn free_indirect_range(
+        &mut self,
+        block: u32,
+        level: u8,
+        start: u64,
+    ) -> Result<u64, Ext2Error> {
+        if block == 0 {
+            return Ok(0);
+        }
+        if start == 0 {
+            return self.free_indirect_tree(block, level);
+        }
+        let pointers = (self.superblock.block_size() / 4) as u64;
+        let mut data = self.read_block_vec(block as u64)?;
+        let mut freed = 0u64;
+        if level == 1 {
+            for index in start..pointers {
+                let child = read_pointer(&data, index as usize);
+                if child != 0 {
+                    self.free_block(child)?;
+                    freed += 1;
+                    write_pointer(&mut data, index as usize, 0);
+                }
+            }
+        } else {
+            let span = pointers.pow((level - 1) as u32);
+            let first = start / span;
+            let offset = start % span;
+            for index in first..pointers {
+                let child = read_pointer(&data, index as usize);
+                if child == 0 {
+                    continue;
+                }
+                if index == first && offset != 0 {
+                    freed += self.free_indirect_range(child, level - 1, offset)?;
+                } else {
+                    freed += self.free_indirect_tree(child, level - 1)?;
+                }
+                write_pointer(&mut data, index as usize, 0);
+            }
+        }
+        self.write_block(block as u64, &data)?;
+        Ok(freed)
+    }
+
     pub fn read_dir(
         &mut self,
         node: NodeId,
@@ -724,6 +1180,38 @@ impl<D: BlockDevice> Ext2<D> {
         let large_file = self.superblock.has_large_file();
         let data = self.block(block_index)?;
         parse_inode(number, &data[within_block..within_block + size], large_file)
+    }
+
+    /// Read-modify-write the inode-table block, preserving fields that this
+    /// kernel never interpreted.
+    fn write_inode(&mut self, inode: &mut Inode) -> Result<(), Ext2Error> {
+        self.require_writable()?;
+        if inode.number == 0 || inode.number > self.superblock.inodes_count() {
+            return Err(Ext2Error::InodeOutOfRange(inode.number));
+        }
+        inode.sync_raw(self.superblock.has_large_file())?;
+        let inode_size = self.superblock.inode_size() as usize;
+        if inode.raw().len() != inode_size {
+            return Err(Ext2Error::CorruptInode);
+        }
+        let index = (inode.number - 1) as u64;
+        let group = (index / self.superblock.inodes_per_group() as u64) as usize;
+        let within_group = index % self.superblock.inodes_per_group() as u64;
+        let descriptor = *self
+            .groups
+            .get(group)
+            .ok_or(Ext2Error::InodeOutOfRange(inode.number))?;
+        let block_size = self.superblock.block_size();
+        let table_offset = descriptor.inode_table as u64 * block_size as u64;
+        let offset = table_offset + within_group * inode_size as u64;
+        let block_index = offset / block_size as u64;
+        let within_block = (offset % block_size as u64) as usize;
+        if within_block + inode_size > block_size {
+            return Err(Ext2Error::CorruptInode);
+        }
+        let mut data = self.read_block_vec(block_index)?;
+        data[within_block..within_block + inode_size].copy_from_slice(inode.raw());
+        self.write_block(block_index, &data)
     }
 
     fn block(&mut self, block: u64) -> Result<&[u8], Ext2Error> {
@@ -847,6 +1335,18 @@ impl<D: BlockDevice + Send> FileSystem for Ext2<D> {
 
     fn read(&mut self, node: NodeId, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError> {
         self.read_file(node, offset, buffer).map_err(VfsError::from)
+    }
+
+    fn write(&mut self, node: NodeId, offset: u64, buffer: &[u8]) -> Result<usize, VfsError> {
+        self.write_file(node, offset, buffer).map_err(VfsError::from)
+    }
+
+    fn truncate(&mut self, node: NodeId, size: u64) -> Result<(), VfsError> {
+        self.truncate_inode(node, size).map_err(VfsError::from)
+    }
+
+    fn sync(&mut self) -> Result<(), VfsError> {
+        Ext2::sync(self).map_err(VfsError::from)
     }
 
     fn readdir(

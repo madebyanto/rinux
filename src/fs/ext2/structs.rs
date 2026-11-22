@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::fs::vfs::FileType;
+use alloc::vec::Vec;
 
 use super::Ext2Error;
 
@@ -335,12 +336,13 @@ impl GroupDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Inode {
     pub(crate) number: u32,
     pub(crate) mode: u16,
     pub(crate) size: u64,
     pub(crate) blocks: [u32; 15],
+    raw: Vec<u8>,
 }
 
 impl Inode {
@@ -354,6 +356,81 @@ impl Inode {
 
     pub(crate) fn is_dir(&self) -> bool {
         self.kind() == FileType::Directory
+    }
+
+    /// The untouched on-disk bytes, including fields this kernel does not
+    /// interpret. `write_inode` copies them back verbatim.
+    pub(crate) fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    pub(crate) fn block(&self, index: usize) -> u32 {
+        self.blocks[index]
+    }
+
+    pub(crate) fn set_block(&mut self, index: usize, block: u32) {
+        self.blocks[index] = block;
+        put_u32(&mut self.raw, 40 + index * 4, block);
+    }
+
+    pub(crate) fn set_mode(&mut self, mode: u16) {
+        self.mode = mode;
+        put_u16(&mut self.raw, 0, mode);
+    }
+
+    pub(crate) fn set_links_count(&mut self, links: u16) {
+        put_u16(&mut self.raw, 26, links);
+    }
+
+    /// Re-apply the decoded fields to the preserved raw bytes before writeback.
+    pub(crate) fn sync_raw(&mut self, large_file: bool) -> Result<(), Ext2Error> {
+        if !large_file && self.size > u32::MAX as u64 {
+            return Err(Ext2Error::FileTooLarge);
+        }
+        put_u16(&mut self.raw, 0, self.mode);
+        put_u32(&mut self.raw, 4, self.size as u32);
+        if self.kind() == FileType::Regular && large_file {
+            put_u32(&mut self.raw, 108, (self.size >> 32) as u32);
+        }
+        for (index, block) in self.blocks.iter().enumerate() {
+            put_u32(&mut self.raw, 40 + index * 4, *block);
+        }
+        Ok(())
+    }
+
+    /// `i_blocks` counts 512-byte sectors, including indirect blocks.
+    pub(crate) fn add_sectors(&mut self, sectors: u32) {
+        let total = u32_at(&self.raw, 28).saturating_add(sectors);
+        put_u32(&mut self.raw, 28, total);
+    }
+
+    pub(crate) fn sub_sectors(&mut self, sectors: u32) {
+        let total = u32_at(&self.raw, 28).saturating_sub(sectors);
+        put_u32(&mut self.raw, 28, total);
+    }
+
+    pub(crate) fn set_size(&mut self, size: u64, large_file: bool) -> Result<(), Ext2Error> {
+        if !large_file && size > u32::MAX as u64 {
+            return Err(Ext2Error::FileTooLarge);
+        }
+        self.size = size;
+        put_u32(&mut self.raw, 4, size as u32);
+        if self.kind() == FileType::Regular && large_file {
+            put_u32(&mut self.raw, 108, (size >> 32) as u32);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_mtime(&mut self, time: u32) {
+        put_u32(&mut self.raw, 16, time);
+    }
+
+    pub(crate) fn set_ctime(&mut self, time: u32) {
+        put_u32(&mut self.raw, 12, time);
+    }
+
+    pub(crate) fn set_dtime(&mut self, time: u32) {
+        put_u32(&mut self.raw, 20, time);
     }
 }
 
@@ -385,5 +462,6 @@ pub(crate) fn parse_inode(
         mode,
         size,
         blocks,
+        raw: raw.to_vec(),
     })
 }

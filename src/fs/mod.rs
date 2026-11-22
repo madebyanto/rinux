@@ -157,6 +157,47 @@ pub fn read_node(node: NodeId, offset: u64, buffer: &mut [u8]) -> Result<usize, 
     vfs.read_at(node, offset, buffer)
 }
 
+pub fn stat_node(node: NodeId) -> Result<Stat, VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.stat_node(node)
+}
+
+pub fn write_node(node: NodeId, offset: u64, buffer: &[u8]) -> Result<usize, VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.write_at(node, offset, buffer)
+}
+
+/// Append under a single VFS lock so the chosen offset and the write cannot be
+/// interleaved with another writer.
+pub fn append_node(node: NodeId, buffer: &[u8]) -> Result<(usize, u64), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    let mut file = File::new(node);
+    vfs.append(&mut file, buffer)
+}
+
+pub fn truncate_node(node: NodeId, size: u64) -> Result<(), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.truncate(node, size)
+}
+
+pub fn truncate_path(path: &str, size: u64) -> Result<(), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    let file = vfs.open(path)?;
+    vfs.truncate(file.node, size)
+}
+
+/// Flush dirty metadata and mark the superblock clean.
+pub fn sync() -> Result<(), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.sync()
+}
+
 pub fn seek(file: &mut File, offset: i64, whence: u8) -> Result<u64, VfsError> {
     let mut guard = VFS.lock();
     let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;

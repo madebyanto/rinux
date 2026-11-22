@@ -16,6 +16,9 @@ pub const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_WAITPID: u64 = 61;
 pub const SYS_KILL: u64 = 62;
+pub const SYS_TRUNCATE: u64 = 76;
+pub const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_SYNC: u64 = 162;
 
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
@@ -35,10 +38,67 @@ pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ENFILE: i64 = 23;
 pub const EMFILE: i64 = 24;
+pub const EFBIG: i64 = 27;
+pub const ENOSPC: i64 = 28;
 pub const EPIPE: i64 = 32;
 pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
+
+/// `open` access mode.
+pub const O_RDONLY: u32 = 0o0;
+pub const O_WRONLY: u32 = 0o1;
+pub const O_RDWR: u32 = 0o2;
+pub const O_ACCMODE: u32 = 0o3;
+pub const O_CREAT: u32 = 0o100;
+pub const O_EXCL: u32 = 0o200;
+pub const O_TRUNC: u32 = 0o1000;
+pub const O_APPEND: u32 = 0o2000;
+pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_DSYNC: u32 = 0o10000;
+pub const O_SYNC: u32 = 0o4010000;
+pub const O_CLOEXEC: u32 = 0o2000000;
+
+pub const O_SUPPORTED: u32 = O_ACCMODE
+    | O_CREAT
+    | O_EXCL
+    | O_TRUNC
+    | O_APPEND
+    | O_NONBLOCK
+    | O_DSYNC
+    | O_SYNC
+    | O_CLOEXEC;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl OpenAccess {
+    #[allow(dead_code)]
+    pub const fn readable(self) -> bool {
+        !matches!(self, OpenAccess::WriteOnly)
+    }
+
+    pub const fn writable(self) -> bool {
+        matches!(self, OpenAccess::WriteOnly | OpenAccess::ReadWrite)
+    }
+}
+
+/// Validate the low 32 bits of an `open` flags argument.
+pub fn validate_open_flags(flags: u32) -> Option<OpenAccess> {
+    if flags & !O_SUPPORTED != 0 {
+        return None;
+    }
+    match flags & O_ACCMODE {
+        O_RDONLY => Some(OpenAccess::ReadOnly),
+        O_WRONLY => Some(OpenAccess::WriteOnly),
+        O_RDWR => Some(OpenAccess::ReadWrite),
+        _ => None,
+    }
+}
 
 /// `waitpid` option: return immediately when no child has exited.
 pub const WNOHANG: u64 = 1;
@@ -60,6 +120,9 @@ pub enum Syscall {
     Execve,
     WaitPid,
     Kill,
+    Truncate,
+    Ftruncate,
+    Sync,
     Exit,
 }
 
@@ -80,6 +143,9 @@ pub fn classify(number: u64) -> Option<Syscall> {
         SYS_EXECVE => Some(Syscall::Execve),
         SYS_WAITPID => Some(Syscall::WaitPid),
         SYS_KILL => Some(Syscall::Kill),
+        SYS_TRUNCATE => Some(Syscall::Truncate),
+        SYS_FTRUNCATE => Some(Syscall::Ftruncate),
+        SYS_SYNC => Some(Syscall::Sync),
         SYS_EXIT => Some(Syscall::Exit),
         _ => None,
     }
