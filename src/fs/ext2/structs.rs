@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::fs::vfs::FileType;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use super::Ext2Error;
@@ -346,6 +347,15 @@ pub(crate) struct Inode {
 }
 
 impl Inode {
+    /// A zeroed inode slot, ready to be initialised by the caller.
+    pub(crate) fn empty(number: u32, inode_size: usize) -> Result<Self, Ext2Error> {
+        if inode_size < MIN_INODE_SIZE {
+            return Err(Ext2Error::CorruptInode);
+        }
+        let raw = vec![0u8; inode_size];
+        parse_inode(number, &raw, false)
+    }
+
     pub(crate) fn kind(&self) -> FileType {
         match self.mode & 0xF000 {
             0x8000 => FileType::Regular,
@@ -362,6 +372,11 @@ impl Inode {
     /// interpret. `write_inode` copies them back verbatim.
     pub(crate) fn raw(&self) -> &[u8] {
         &self.raw
+    }
+
+    /// `i_flags`, including `EXT2_INDEX_FL`.
+    pub(crate) fn flags(&self) -> u32 {
+        u32_at(&self.raw, 32)
     }
 
     pub(crate) fn block(&self, index: usize) -> u32 {
@@ -419,6 +434,10 @@ impl Inode {
             put_u32(&mut self.raw, 108, (size >> 32) as u32);
         }
         Ok(())
+    }
+
+    pub(crate) fn set_atime(&mut self, time: u32) {
+        put_u32(&mut self.raw, 8, time);
     }
 
     pub(crate) fn set_mtime(&mut self, time: u32) {

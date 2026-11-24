@@ -33,6 +33,7 @@ pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;
 pub const EACCES: i64 = 13;
 pub const EFAULT: i64 = 14;
+pub const EEXIST: i64 = 17;
 pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
@@ -44,30 +45,14 @@ pub const EPIPE: i64 = 32;
 pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
+pub const EOPNOTSUPP: i64 = 95;
 
-/// `open` access mode.
-pub const O_RDONLY: u32 = 0o0;
-pub const O_WRONLY: u32 = 0o1;
-pub const O_RDWR: u32 = 0o2;
-pub const O_ACCMODE: u32 = 0o3;
-pub const O_CREAT: u32 = 0o100;
-pub const O_EXCL: u32 = 0o200;
-pub const O_TRUNC: u32 = 0o1000;
-pub const O_APPEND: u32 = 0o2000;
-pub const O_NONBLOCK: u32 = 0o4000;
-pub const O_DSYNC: u32 = 0o10000;
-pub const O_SYNC: u32 = 0o4010000;
-pub const O_CLOEXEC: u32 = 0o2000000;
-
-pub const O_SUPPORTED: u32 = O_ACCMODE
-    | O_CREAT
-    | O_EXCL
-    | O_TRUNC
-    | O_APPEND
-    | O_NONBLOCK
-    | O_DSYNC
-    | O_SYNC
-    | O_CLOEXEC;
+/// `open` flags live in the VFS layer so filesystem code can use them too.
+#[allow(unused_imports)]
+pub use crate::fs::vfs::{
+    O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DSYNC, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
+    O_SUPPORTED, O_SYNC, O_TRUNC, O_WRONLY,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAccess {

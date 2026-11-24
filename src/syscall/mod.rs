@@ -287,16 +287,12 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     }
 }
 
-fn sys_open(path: u64, flags: u64, _mode: u64) -> u64 {
+fn sys_open(path: u64, flags: u64, mode: u64) -> u64 {
     let flags = flags as u32;
     let access = match abi::validate_open_flags(flags) {
         Some(access) => access,
         None => return abi::errno(abi::EINVAL),
     };
-    // Directory entry creation arrives with Step 3.
-    if flags & abi::O_CREAT != 0 {
-        return abi::errno(abi::ENOENT);
-    }
     if flags & abi::O_TRUNC != 0 && !access.writable() {
         return abi::errno(abi::EACCES);
     }
@@ -304,22 +300,15 @@ fn sys_open(path: u64, flags: u64, _mode: u64) -> u64 {
         Ok(path) => path,
         Err(error) => return error,
     };
-    let file = match fs::open(&path) {
+    let mode = if mode == 0 {
+        0o644
+    } else {
+        (mode as u16) & 0o7777
+    };
+    let file = match fs::open_with_flags(&path, flags, mode) {
         Ok(file) => file,
         Err(error) => return vfs_errno(error),
     };
-    if flags & abi::O_TRUNC != 0 {
-        let stat = match fs::stat_node(file.node) {
-            Ok(stat) => stat,
-            Err(error) => return vfs_errno(error),
-        };
-        if stat.kind != FileType::Regular {
-            return abi::errno(abi::EISDIR);
-        }
-        if let Err(error) = fs::truncate_node(file.node, 0) {
-            return vfs_errno(error);
-        }
-    }
     match scheduler::current_open_fd(file.node, flags) {
         Ok(fd) => fd as u64,
         Err(error) => fd_errno(error),
@@ -867,11 +856,12 @@ fn vfs_errno(error: VfsError) -> u64 {
         VfsError::NotFound => abi::errno(abi::ENOENT),
         VfsError::NotDirectory => abi::errno(abi::ENOTDIR),
         VfsError::NotFile => abi::errno(abi::EISDIR),
+        VfsError::AlreadyExists => abi::errno(abi::EEXIST),
         VfsError::InvalidPath => abi::errno(abi::EINVAL),
         VfsError::InvalidOffset => abi::errno(abi::EINVAL),
         VfsError::Corrupt => abi::errno(abi::EIO),
         VfsError::Device => abi::errno(abi::EIO),
-        VfsError::Unsupported => abi::errno(abi::EINVAL),
+        VfsError::Unsupported => abi::errno(abi::EOPNOTSUPP),
         VfsError::ReadOnly => abi::errno(abi::EROFS),
         VfsError::NoSpace => abi::errno(abi::ENOSPC),
         VfsError::FileTooLarge => abi::errno(abi::EFBIG),

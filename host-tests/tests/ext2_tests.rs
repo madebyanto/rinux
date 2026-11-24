@@ -1,11 +1,16 @@
 use hosttest::fs::ext2::bitmap::Bitmap;
+use hosttest::fs::ext2::dir::{
+    init_dot_dotdot_block, init_empty_dir_block, insert_dir_entry, remove_dir_entry,
+};
 use hosttest::fs::ext2::layout;
 use hosttest::fs::ext2::structs::Superblock;
 use hosttest::fs::ext2::{
     block_path, parse_dir_entry, BlockDevice, BlockPath, Ext2, Ext2Error,
 };
 use hosttest::fs::ramdisk::RamDisk;
-use hosttest::fs::vfs::{DirCursor, FileType, Vfs};
+use hosttest::fs::vfs::{
+    DirCursor, FileType, Vfs, VfsError, O_CREAT, O_EXCL, O_RDWR, O_TRUNC,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -802,6 +807,284 @@ fn vfs_write_append_and_truncate_follow_open_semantics() {
 }
 
 #[test]
+fn directory_block_insert_splits_and_reuses_space() {
+    let mut block = vec![0u8; 1024];
+    init_empty_dir_block(&mut block);
+    let (hole, end) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(hole.inode, 0);
+    assert_eq!(end, 1024);
+
+    assert!(insert_dir_entry(&mut block, b"alpha", 11, 1, true));
+    let (entry, next) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(entry.inode, 11);
+    assert_eq!(entry.file_type, 1);
+    assert_eq!(entry.name_len, 5);
+    assert_eq!(&block[entry.name_start..entry.name_start + 5], b"alpha");
+    assert_eq!(next, 16);
+    let (hole, end) = parse_dir_entry(&block, next, true).unwrap();
+    assert_eq!(hole.inode, 0);
+    assert_eq!(end, 1024);
+
+    // The free hole left by the first insert is reused.
+    assert!(insert_dir_entry(&mut block, b"beta", 12, 1, true));
+    let (entry, next) = parse_dir_entry(&block, 16, true).unwrap();
+    assert_eq!(entry.inode, 12);
+    assert_eq!(&block[entry.name_start..entry.name_start + 4], b"beta");
+    assert_eq!(next, 28);
+    let (hole, end) = parse_dir_entry(&block, 28, true).unwrap();
+    assert_eq!(hole.inode, 0);
+    assert_eq!(end, 1024);
+
+    // An active entry that still owns slack is split in place.
+    let mut block = vec![0u8; 1024];
+    block[0..4].copy_from_slice(&7u32.to_le_bytes());
+    block[4..6].copy_from_slice(&1024u16.to_le_bytes());
+    block[6] = 1;
+    block[7] = 1;
+    block[8] = b'a';
+    assert!(insert_dir_entry(&mut block, b"b", 8, 1, true));
+    let (first, next) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(first.inode, 7);
+    assert_eq!(next, 12);
+    let (second, next) = parse_dir_entry(&block, 12, true).unwrap();
+    assert_eq!(second.inode, 8);
+    assert_eq!(next, 24);
+    let (hole, end) = parse_dir_entry(&block, 24, true).unwrap();
+    assert_eq!(hole.inode, 0);
+    assert_eq!(end, 1024);
+}
+
+#[test]
+fn directory_block_insert_absorbs_small_remainders() {
+    let mut block = vec![0u8; 1024];
+    // Active entry "a" claims 28 bytes, followed by a free hole.
+    block[0..4].copy_from_slice(&7u32.to_le_bytes());
+    block[4..6].copy_from_slice(&28u16.to_le_bytes());
+    block[6] = 1;
+    block[7] = 1;
+    block[8] = b'a';
+    block[28..32].copy_from_slice(&0u32.to_le_bytes());
+    block[32..34].copy_from_slice(&996u16.to_le_bytes());
+
+    assert!(insert_dir_entry(&mut block, b"b", 8, 1, true));
+    let (first, next) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(first.inode, 7);
+    assert_eq!(next, 12);
+    let (second, next) = parse_dir_entry(&block, 12, true).unwrap();
+    assert_eq!(second.inode, 8);
+    // 16 bytes remain, 12 are needed, so the 4-byte tail is absorbed.
+    assert_eq!(next, 28);
+    let (hole, end) = parse_dir_entry(&block, 28, true).unwrap();
+    assert_eq!(hole.inode, 0);
+    assert_eq!(end, 1024);
+
+    // A free hole that fits exactly keeps its full length.
+    let mut block = vec![0u8; 12];
+    init_empty_dir_block(&mut block);
+    assert!(insert_dir_entry(&mut block, b"x", 5, 1, true));
+    let (entry, next) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(entry.inode, 5);
+    assert_eq!(next, 12);
+}
+
+#[test]
+fn directory_block_insert_without_filetype_uses_u16_name_length() {
+    let mut block = vec![0u8; 1024];
+    init_empty_dir_block(&mut block);
+    assert!(insert_dir_entry(&mut block, b"name", 9, 0, false));
+    let (entry, next) = parse_dir_entry(&block, 0, false).unwrap();
+    assert_eq!(entry.inode, 9);
+    assert_eq!(entry.name_len, 4);
+    assert_eq!(u16::from_le_bytes([block[6], block[7]]), 4);
+    assert_eq!(&block[8..12], b"name");
+    assert_eq!(next, 12);
+}
+
+#[test]
+fn directory_block_remove_merges_with_predecessor() {
+    let mut block = vec![0u8; 1024];
+    block[0..4].copy_from_slice(&1u32.to_le_bytes());
+    block[4..6].copy_from_slice(&12u16.to_le_bytes());
+    block[6] = 1;
+    block[7] = 1;
+    block[8] = b'a';
+    block[12..16].copy_from_slice(&2u32.to_le_bytes());
+    block[16..18].copy_from_slice(&12u16.to_le_bytes());
+    block[18] = 1;
+    block[19] = 1;
+    block[20] = b'b';
+    block[24..28].copy_from_slice(&0u32.to_le_bytes());
+    block[28..30].copy_from_slice(&1000u16.to_le_bytes());
+
+    remove_dir_entry(&mut block, 12, true).unwrap();
+    let (first, next) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(first.inode, 1);
+    assert_eq!(next, 24);
+    let (hole, end) = parse_dir_entry(&block, 24, true).unwrap();
+    assert_eq!(hole.inode, 0);
+    assert_eq!(end, 1024);
+}
+
+#[test]
+fn directory_block_remove_first_entry_leaves_a_hole() {
+    let mut block = vec![0u8; 1024];
+    block[0..4].copy_from_slice(&1u32.to_le_bytes());
+    block[4..6].copy_from_slice(&12u16.to_le_bytes());
+    block[6] = 1;
+    block[7] = 1;
+    block[8] = b'a';
+    block[12..16].copy_from_slice(&0u32.to_le_bytes());
+    block[16..18].copy_from_slice(&1012u16.to_le_bytes());
+
+    remove_dir_entry(&mut block, 0, true).unwrap();
+    let (hole, next) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(hole.inode, 0);
+    assert_eq!(next, 12);
+    assert_eq!(u16::from_le_bytes([block[4], block[5]]), 12);
+    let (free, end) = parse_dir_entry(&block, 12, true).unwrap();
+    assert_eq!(free.inode, 0);
+    assert_eq!(end, 1024);
+}
+
+#[test]
+fn directory_block_initialises_dot_and_dotdot() {
+    let mut block = vec![0u8; 1024];
+    init_dot_dotdot_block(&mut block, 2, 2, true);
+    let (dot, next) = parse_dir_entry(&block, 0, true).unwrap();
+    assert_eq!(dot.inode, 2);
+    assert_eq!(dot.name_len, 1);
+    assert_eq!(&block[dot.name_start..dot.name_start + 1], b".");
+    assert_eq!(next, 12);
+    let (dotdot, next) = parse_dir_entry(&block, 12, true).unwrap();
+    assert_eq!(dotdot.inode, 2);
+    assert_eq!(dotdot.name_len, 2);
+    assert_eq!(&block[dotdot.name_start..dotdot.name_start + 2], b"..");
+    assert_eq!(next, 1024);
+}
+
+#[test]
+fn creates_files_with_o_creat_and_o_excl() {
+    let mut filesystem = fresh_rw();
+    let node = filesystem
+        .open_flags("/created.txt", O_CREAT | O_RDWR, 0o640)
+        .unwrap();
+    let stat = filesystem.stat_inode(node).unwrap();
+    assert_eq!(stat.size, 0);
+    assert_eq!(stat.kind, FileType::Regular);
+    assert_eq!(stat.mode & 0o777, 0o640);
+    assert_eq!(filesystem.lookup("/created.txt").unwrap(), node);
+    assert_eq!(filesystem.write_file(node, 0, b"created").unwrap(), 7);
+    let mut buffer = [0u8; 16];
+    let count = filesystem.read_file(node, 0, &mut buffer).unwrap();
+    assert_eq!(&buffer[..count], b"created");
+
+    // O_CREAT on an existing file just opens it without truncating.
+    assert_eq!(
+        filesystem
+            .open_flags("/created.txt", O_CREAT | O_RDWR, 0o600)
+            .unwrap(),
+        node
+    );
+    assert_eq!(filesystem.stat_inode(node).unwrap().size, 7);
+    // O_CREAT | O_EXCL on a missing path creates the file.
+    let exclusive = filesystem
+        .open_flags("/exclusive.txt", O_CREAT | O_EXCL | O_RDWR, 0o600)
+        .unwrap();
+    assert_eq!(filesystem.lookup("/exclusive.txt").unwrap(), exclusive);
+    assert_eq!(
+        filesystem.open_flags("/created.txt", O_CREAT | O_EXCL | O_RDWR, 0o600),
+        Err(Ext2Error::AlreadyExists)
+    );
+    // A missing file without O_CREAT is still an error.
+    assert_eq!(
+        filesystem.open_flags("/missing.txt", O_RDWR, 0o600),
+        Err(Ext2Error::NotFound)
+    );
+    // Directories cannot be opened for writing.
+    assert_eq!(
+        filesystem.open_flags("/sub", O_RDWR, 0o600),
+        Err(Ext2Error::NotFile)
+    );
+
+    // O_TRUNC empties an existing regular file, even with O_CREAT set.
+    let hello = filesystem.lookup("/hello.txt").unwrap();
+    assert_eq!(
+        filesystem
+            .open_flags("/hello.txt", O_CREAT | O_RDWR | O_TRUNC, 0)
+            .unwrap(),
+        hello
+    );
+    assert_eq!(filesystem.stat_inode(hello).unwrap().size, 0);
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn creating_many_files_grows_the_directory_across_blocks() {
+    let mut filesystem = fresh_rw();
+    let root = filesystem.lookup("/").unwrap();
+    let initial_size = filesystem.stat_inode(root).unwrap().size;
+    let mut created = Vec::new();
+    for index in 0..40 {
+        let name = format!("/file-{:02}-{}.txt", index, "x".repeat(180));
+        let node = filesystem
+            .open_flags(&name, O_CREAT | O_RDWR, 0o644)
+            .unwrap();
+        let payload = format!("payload-{}", index);
+        assert_eq!(
+            filesystem.write_file(node, 0, payload.as_bytes()).unwrap(),
+            payload.len()
+        );
+        created.push((name, node, payload));
+    }
+    assert!(
+        filesystem.stat_inode(root).unwrap().size > initial_size + 3 * 1024,
+        "directory should span several blocks"
+    );
+    for (name, node, payload) in &created {
+        assert_eq!(filesystem.lookup(name).unwrap(), *node);
+        let mut buffer = [0u8; 32];
+        let count = filesystem.read_file(*node, 0, &mut buffer).unwrap();
+        assert_eq!(&buffer[..count], payload.as_bytes());
+    }
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn vfs_open_with_flags_creates_and_truncates() {
+    let mut vfs = Vfs::new(Box::new(fresh_rw()));
+    let mut file = vfs
+        .open_with_flags("/vfs-created.txt", O_CREAT | O_RDWR, 0o644)
+        .unwrap();
+    assert_eq!(file.flags & 0o3, O_RDWR);
+    assert_eq!(vfs.write(&mut file, b"hello").unwrap(), 5);
+    assert_eq!(vfs.stat("/vfs-created.txt").unwrap().size, 5);
+
+    assert!(matches!(
+        vfs.open_with_flags("/vfs-created.txt", O_CREAT | O_EXCL | O_RDWR, 0o644),
+        Err(VfsError::AlreadyExists)
+    ));
+    let existing = vfs
+        .open_with_flags("/vfs-created.txt", O_CREAT | O_RDWR, 0o644)
+        .unwrap();
+    assert_eq!(existing.node, file.node);
+
+    let truncated = vfs
+        .open_with_flags("/vfs-created.txt", O_RDWR | O_TRUNC, 0)
+        .unwrap();
+    assert_eq!(vfs.stat_node(truncated.node).unwrap().size, 0);
+    assert!(matches!(
+        vfs.open_with_flags("/sub", O_RDWR, 0),
+        Err(VfsError::NotFile)
+    ));
+}
+
+#[test]
 fn writes_and_truncates_on_four_kib_blocks() {
     let data = build_minimal_image("4096", "256", "8192");
     let mut filesystem = Ext2::mount_rw_with_clock(RamDisk::new(data), || 1_700_000_000).unwrap();
@@ -830,6 +1113,14 @@ fn writes_and_truncates_on_four_kib_blocks() {
         filesystem.stat_inode(node).unwrap().size,
         50 * 1024
     );
+    let created = filesystem
+        .open_flags("/created-256.txt", O_CREAT | O_RDWR, 0o644)
+        .unwrap();
+    assert_eq!(
+        filesystem.write_file(created, 0, b"created").unwrap(),
+        7
+    );
+    assert_eq!(filesystem.lookup("/created-256.txt").unwrap(), created);
     filesystem.sync().unwrap();
     let disk = filesystem.into_device();
     e2fsck(disk.data());

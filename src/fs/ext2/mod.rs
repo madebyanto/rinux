@@ -8,18 +8,25 @@ pub use dir::parse_dir_entry;
 pub use inode::{block_path, BlockPath};
 pub use structs::{GroupDescriptor, Superblock};
 
-use super::vfs::{DirCursor, DirEntry, FileSystem, FileType, NodeId, Stat, VfsError};
+use super::vfs::{
+    DirCursor, DirEntry, FileSystem, FileType, NodeId, Stat, VfsError, O_ACCMODE, O_CREAT,
+    O_EXCL, O_RDONLY, O_TRUNC,
+};
 use ::alloc::string::String;
 use ::alloc::vec;
 use ::alloc::vec::Vec;
 use bitmap::Bitmap;
+use dir::{init_empty_dir_block, insert_dir_entry};
 use inode::{read_pointer, write_pointer};
 use structs::{
-    parse_inode, Inode, GROUP_DESCRIPTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE, VALID_FS,
+    parse_inode, Inode, EXT2_INDEX_FL, GROUP_DESCRIPTOR_SIZE, SUPERBLOCK_OFFSET,
+    SUPERBLOCK_SIZE, VALID_FS,
 };
 
 pub const MAX_PATH: usize = 256;
 const CACHE_ENTRIES: usize = 16;
+const S_IFREG: u16 = 0x8000;
+const EXT2_FT_REG_FILE: u8 = 1;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +35,8 @@ pub enum Ext2Error {
     ReadOnly,
     NoSpace,
     FileTooLarge,
+    Unsupported,
+    AlreadyExists,
     BadMagic(u16),
     BadSuperblock,
     UnsupportedFeature {
@@ -56,6 +65,8 @@ impl core::fmt::Display for Ext2Error {
             Ext2Error::ReadOnly => write!(formatter, "filesystem is mounted read-only"),
             Ext2Error::NoSpace => write!(formatter, "no space left on device"),
             Ext2Error::FileTooLarge => write!(formatter, "file too large"),
+            Ext2Error::Unsupported => write!(formatter, "unsupported operation"),
+            Ext2Error::AlreadyExists => write!(formatter, "file exists"),
             Ext2Error::BadMagic(magic) => write!(formatter, "bad ext2 magic {:#x}", magic),
             Ext2Error::BadSuperblock => write!(formatter, "invalid ext2 superblock"),
             Ext2Error::UnsupportedFeature {
@@ -96,6 +107,8 @@ impl From<Ext2Error> for VfsError {
             Ext2Error::ReadOnly => VfsError::ReadOnly,
             Ext2Error::NoSpace => VfsError::NoSpace,
             Ext2Error::FileTooLarge => VfsError::FileTooLarge,
+            Ext2Error::Unsupported => VfsError::Unsupported,
+            Ext2Error::AlreadyExists => VfsError::AlreadyExists,
             Ext2Error::NotFound => VfsError::NotFound,
             Ext2Error::NotDirectory => VfsError::NotDirectory,
             Ext2Error::NotFile => VfsError::NotFile,
@@ -609,6 +622,145 @@ impl<D: BlockDevice> Ext2<D> {
             mode: inode.mode,
             kind: inode.kind(),
         })
+    }
+
+    /// Resolve `path`, creating the final component when `O_CREAT` is set.
+    pub fn open_flags(&mut self, path: &str, flags: u32, mode: u16) -> Result<NodeId, Ext2Error> {
+        if path.len() > MAX_PATH {
+            return Err(Ext2Error::InvalidPath);
+        }
+        match self.lookup(path) {
+            Ok(node) => {
+                let inode = self.read_inode(node)?;
+                if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+                    return Err(Ext2Error::AlreadyExists);
+                }
+                if inode.is_dir()
+                    && (flags & (O_CREAT | O_TRUNC) != 0 || flags & O_ACCMODE != O_RDONLY)
+                {
+                    return Err(Ext2Error::NotFile);
+                }
+                if flags & O_TRUNC != 0 {
+                    if inode.kind() != FileType::Regular {
+                        return Err(Ext2Error::NotFile);
+                    }
+                    self.truncate_inode(node, 0)?;
+                }
+                Ok(node)
+            }
+            Err(Ext2Error::NotFound) => {
+                if flags & O_CREAT == 0 {
+                    return Err(Ext2Error::NotFound);
+                }
+                let (parent_path, name) = split_parent(path)?;
+                let parent = self.lookup(parent_path)?;
+                self.create_file(parent, name, mode)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Create a regular file in `parent`, failing if the name already exists.
+    pub fn create_file(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        mode: u16,
+    ) -> Result<NodeId, Ext2Error> {
+        self.require_writable()?;
+        let mut parent_inode = self.read_inode(parent)?;
+        self.check_directory_mutable(&parent_inode)?;
+        validate_name(name)?;
+        match self.find_entry(&parent_inode, name) {
+            Ok(_) => return Err(Ext2Error::AlreadyExists),
+            Err(Ext2Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let group = layout::inode_location(&self.superblock, parent)
+            .map(|(group, _)| group as usize)
+            .unwrap_or(0);
+        let child = self.allocate_inode(group, false)?;
+        let mut inode = match Inode::empty(child, self.superblock.inode_size() as usize) {
+            Ok(inode) => inode,
+            Err(error) => {
+                let _ = self.free_inode(child, false);
+                return Err(error);
+            }
+        };
+        inode.set_mode(S_IFREG | (mode & 0o7777));
+        inode.set_links_count(1);
+        let now = self.now();
+        inode.set_atime(now);
+        inode.set_mtime(now);
+        inode.set_ctime(now);
+        if let Err(error) = self.write_inode(&mut inode) {
+            let _ = self.free_inode(child, false);
+            return Err(error);
+        }
+        if let Err(error) = self.add_dir_entry(&mut parent_inode, name, child, EXT2_FT_REG_FILE) {
+            let _ = self.free_inode(child, false);
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    /// Insert a directory entry, allocating a new directory block if needed.
+    fn add_dir_entry(
+        &mut self,
+        dir: &mut Inode,
+        name: &str,
+        child: u32,
+        file_type: u8,
+    ) -> Result<(), Ext2Error> {
+        self.require_writable()?;
+        self.check_directory_mutable(dir)?;
+        validate_name(name)?;
+        if child == 0 || child > self.superblock.inodes_count() {
+            return Err(Ext2Error::CorruptInode);
+        }
+        let block_size = self.superblock.block_size();
+        let block_count = (dir.size + block_size as u64 - 1) / block_size as u64;
+        for logical in 0..block_count {
+            let disk = self.map_block(dir, logical)?;
+            if disk == 0 {
+                return Err(Ext2Error::CorruptDirectory);
+            }
+            let mut data = self.read_block_vec(disk as u64)?;
+            if insert_dir_entry(&mut data, name.as_bytes(), child, file_type, self.has_filetype) {
+                self.write_block(disk as u64, &data)?;
+                return self.touch_inode(dir);
+            }
+        }
+        let logical = block_count;
+        let block = self.ensure_block(dir, logical)?;
+        let mut data = self.read_block_vec(block as u64)?;
+        init_empty_dir_block(&mut data);
+        if !insert_dir_entry(&mut data, name.as_bytes(), child, file_type, self.has_filetype) {
+            return Err(Ext2Error::CorruptDirectory);
+        }
+        self.write_block(block as u64, &data)?;
+        let new_size = (logical + 1) * block_size as u64;
+        if new_size > dir.size {
+            dir.set_size(new_size, self.superblock.has_large_file())?;
+        }
+        self.touch_inode(dir)
+    }
+
+    fn touch_inode(&mut self, inode: &mut Inode) -> Result<(), Ext2Error> {
+        let now = self.now();
+        inode.set_mtime(now);
+        inode.set_ctime(now);
+        self.write_inode(inode)
+    }
+
+    fn check_directory_mutable(&self, inode: &Inode) -> Result<(), Ext2Error> {
+        if !inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        if inode.flags() & EXT2_INDEX_FL != 0 {
+            return Err(Ext2Error::Unsupported);
+        }
+        Ok(())
     }
 
     pub fn read_file(
@@ -1287,6 +1439,34 @@ impl<D: BlockDevice> Ext2<D> {
     }
 }
 
+fn split_parent(path: &str) -> Result<(&str, &str), Ext2Error> {
+    if path.is_empty() || path.ends_with('/') {
+        return Err(Ext2Error::InvalidPath);
+    }
+    let (parent, name) = match path.rfind('/') {
+        Some(index) => {
+            let parent = if index == 0 { "/" } else { &path[..index] };
+            (parent, &path[index + 1..])
+        }
+        None => ("/", path),
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(Ext2Error::InvalidPath);
+    }
+    Ok((parent, name))
+}
+
+fn validate_name(name: &str) -> Result<(), Ext2Error> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 255 {
+        return Err(Ext2Error::InvalidPath);
+    }
+    if bytes.iter().any(|byte| *byte == b'/' || *byte == 0) {
+        return Err(Ext2Error::InvalidPath);
+    }
+    Ok(())
+}
+
 fn read_groups<D: BlockDevice>(
     device: &mut D,
     cache: &mut BlockCache,
@@ -1327,6 +1507,15 @@ fn read_groups<D: BlockDevice>(
 impl<D: BlockDevice + Send> FileSystem for Ext2<D> {
     fn open(&mut self, path: &str) -> Result<NodeId, VfsError> {
         self.lookup(path).map_err(VfsError::from)
+    }
+
+    fn open_with_flags(
+        &mut self,
+        path: &str,
+        flags: u32,
+        mode: u16,
+    ) -> Result<NodeId, VfsError> {
+        self.open_flags(path, flags, mode).map_err(VfsError::from)
     }
 
     fn stat(&mut self, node: NodeId) -> Result<Stat, VfsError> {

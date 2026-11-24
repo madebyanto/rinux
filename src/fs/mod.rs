@@ -145,6 +145,12 @@ pub fn open(path: &str) -> Result<File, VfsError> {
     vfs.open(path)
 }
 
+pub fn open_with_flags(path: &str, flags: u32, mode: u16) -> Result<File, VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.open_with_flags(path, flags, mode)
+}
+
 pub fn stat_path(path: &str) -> Result<Stat, VfsError> {
     let mut guard = VFS.lock();
     let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
@@ -157,6 +163,7 @@ pub fn read_node(node: NodeId, offset: u64, buffer: &mut [u8]) -> Result<usize, 
     vfs.read_at(node, offset, buffer)
 }
 
+#[allow(dead_code)]
 pub fn stat_node(node: NodeId) -> Result<Stat, VfsError> {
     let mut guard = VFS.lock();
     let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;

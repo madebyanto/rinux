@@ -3,6 +3,30 @@ use alloc::string::String;
 
 pub type NodeId = u32;
 
+/// `open` access mode and flag bits (Linux x86-64 values).
+pub const O_RDONLY: u32 = 0o0;
+pub const O_WRONLY: u32 = 0o1;
+pub const O_RDWR: u32 = 0o2;
+pub const O_ACCMODE: u32 = 0o3;
+pub const O_CREAT: u32 = 0o100;
+pub const O_EXCL: u32 = 0o200;
+pub const O_TRUNC: u32 = 0o1000;
+pub const O_APPEND: u32 = 0o2000;
+pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_DSYNC: u32 = 0o10000;
+pub const O_SYNC: u32 = 0o4010000;
+pub const O_CLOEXEC: u32 = 0o2000000;
+
+pub const O_SUPPORTED: u32 = O_ACCMODE
+    | O_CREAT
+    | O_EXCL
+    | O_TRUNC
+    | O_APPEND
+    | O_NONBLOCK
+    | O_DSYNC
+    | O_SYNC
+    | O_CLOEXEC;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Regular,
@@ -71,6 +95,7 @@ pub enum VfsError {
     NotFound,
     NotDirectory,
     NotFile,
+    AlreadyExists,
     InvalidPath,
     InvalidOffset,
     Corrupt,
@@ -83,6 +108,19 @@ pub enum VfsError {
 
 pub trait FileSystem: Send {
     fn open(&mut self, path: &str) -> Result<NodeId, VfsError>;
+
+    /// Resolve `path`, optionally creating the final component. Filesystems
+    /// that cannot create files keep the default `open` behaviour.
+    fn open_with_flags(
+        &mut self,
+        path: &str,
+        flags: u32,
+        mode: u16,
+    ) -> Result<NodeId, VfsError> {
+        let _ = (flags, mode);
+        self.open(path)
+    }
+
     fn stat(&mut self, node: NodeId) -> Result<Stat, VfsError>;
     fn read(&mut self, node: NodeId, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError>;
     fn write(&mut self, node: NodeId, offset: u64, buffer: &[u8]) -> Result<usize, VfsError>;
@@ -116,11 +154,22 @@ impl Vfs {
         Ok(File::new(node))
     }
 
+    pub fn open_with_flags(
+        &mut self,
+        path: &str,
+        flags: u32,
+        mode: u16,
+    ) -> Result<File, VfsError> {
+        let node = self.root.open_with_flags(path, flags, mode)?;
+        Ok(File::with_flags(node, flags))
+    }
+
     pub fn stat(&mut self, path: &str) -> Result<Stat, VfsError> {
         let node = self.root.open(path)?;
         self.root.stat(node)
     }
 
+    #[allow(dead_code)]
     pub fn stat_node(&mut self, node: NodeId) -> Result<Stat, VfsError> {
         self.root.stat(node)
     }
@@ -226,6 +275,7 @@ impl core::fmt::Display for VfsError {
             VfsError::NotFound => write!(formatter, "not found"),
             VfsError::NotDirectory => write!(formatter, "not a directory"),
             VfsError::NotFile => write!(formatter, "not a regular file"),
+            VfsError::AlreadyExists => write!(formatter, "already exists"),
             VfsError::InvalidPath => write!(formatter, "invalid path"),
             VfsError::InvalidOffset => write!(formatter, "invalid file offset"),
             VfsError::Corrupt => write!(formatter, "corrupt filesystem"),
