@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 
 pub type NodeId = u32;
@@ -96,6 +97,9 @@ pub enum VfsError {
     NotDirectory,
     NotFile,
     AlreadyExists,
+    NotEmpty,
+    Busy,
+    InvalidArgument,
     InvalidPath,
     InvalidOffset,
     Corrupt,
@@ -121,6 +125,43 @@ pub trait FileSystem: Send {
         self.open(path)
     }
 
+    /// Create a directory at `path`.
+    fn mkdir(&mut self, path: &str, mode: u16) -> Result<NodeId, VfsError> {
+        let _ = (path, mode);
+        Err(VfsError::Unsupported)
+    }
+
+    /// Remove an empty directory at `path`.
+    fn rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+        let _ = path;
+        Err(VfsError::Unsupported)
+    }
+
+    /// Remove a non-directory entry. `still_open` defers freeing the inode when
+    /// the last link disappears while a descriptor is still using it.
+    fn unlink(&mut self, path: &str, still_open: bool) -> Result<NodeId, VfsError> {
+        let _ = (path, still_open);
+        Err(VfsError::Unsupported)
+    }
+
+    /// Move `old_path` to `new_path`, replacing a destination entry when
+    /// POSIX allows it.
+    fn rename(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+        target_open: bool,
+    ) -> Result<(), VfsError> {
+        let _ = (old_path, new_path, target_open);
+        Err(VfsError::Unsupported)
+    }
+
+    /// Free an inode whose link count reached zero while still open.
+    fn release_unlinked(&mut self, node: NodeId) -> Result<(), VfsError> {
+        let _ = node;
+        Ok(())
+    }
+
     fn stat(&mut self, node: NodeId) -> Result<Stat, VfsError>;
     fn read(&mut self, node: NodeId, offset: u64, buffer: &mut [u8]) -> Result<usize, VfsError>;
     fn write(&mut self, node: NodeId, offset: u64, buffer: &[u8]) -> Result<usize, VfsError>;
@@ -138,11 +179,68 @@ pub trait FileSystem: Send {
 
 pub struct Vfs {
     root: Box<dyn FileSystem>,
+    /// Number of live descriptors per inode. `fork` duplicates every entry, so
+    /// one inode can be open through several processes at once.
+    open_nodes: BTreeMap<NodeId, u32>,
 }
 
 impl Vfs {
     pub fn new(root: Box<dyn FileSystem>) -> Self {
-        Self { root }
+        Self {
+            root,
+            open_nodes: BTreeMap::new(),
+        }
+    }
+
+    /// Record one more open descriptor for `node`; used by `open`, `dup` and
+    /// `fork`.
+    pub fn retain(&mut self, node: NodeId) {
+        let count = self.open_nodes.entry(node).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// Release one descriptor. The final close of an unlinked inode finishes
+    /// the deletion that `unlink`/`rename` deferred.
+    pub fn close(&mut self, node: NodeId) -> Result<(), VfsError> {
+        let remaining = match self.open_nodes.get_mut(&node) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count
+            }
+            None => return Ok(()),
+        };
+        if remaining == 0 {
+            self.open_nodes.remove(&node);
+            self.root.release_unlinked(node)?;
+        }
+        Ok(())
+    }
+
+    pub fn open_count(&self, node: NodeId) -> u32 {
+        self.open_nodes.get(&node).copied().unwrap_or(0)
+    }
+
+    pub fn mkdir(&mut self, path: &str, mode: u16) -> Result<NodeId, VfsError> {
+        self.root.mkdir(path, mode)
+    }
+
+    pub fn rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+        self.root.rmdir(path)
+    }
+
+    pub fn unlink(&mut self, path: &str) -> Result<NodeId, VfsError> {
+        let node = self.root.open(path)?;
+        let still_open = self.open_count(node) > 0;
+        self.root.unlink(path, still_open)
+    }
+
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), VfsError> {
+        let target_open = match self.root.open(new_path) {
+            Ok(node) => self.open_count(node) > 0,
+            Err(VfsError::NotFound) => false,
+            Err(error) => return Err(error),
+        };
+        self.root.rename(old_path, new_path, target_open)
     }
 
     pub fn root_node(&mut self) -> Result<NodeId, VfsError> {
@@ -151,6 +249,7 @@ impl Vfs {
 
     pub fn open(&mut self, path: &str) -> Result<File, VfsError> {
         let node = self.root.open(path)?;
+        self.retain(node);
         Ok(File::new(node))
     }
 
@@ -161,6 +260,7 @@ impl Vfs {
         mode: u16,
     ) -> Result<File, VfsError> {
         let node = self.root.open_with_flags(path, flags, mode)?;
+        self.retain(node);
         Ok(File::with_flags(node, flags))
     }
 
@@ -276,6 +376,9 @@ impl core::fmt::Display for VfsError {
             VfsError::NotDirectory => write!(formatter, "not a directory"),
             VfsError::NotFile => write!(formatter, "not a regular file"),
             VfsError::AlreadyExists => write!(formatter, "already exists"),
+            VfsError::NotEmpty => write!(formatter, "directory not empty"),
+            VfsError::Busy => write!(formatter, "resource busy"),
+            VfsError::InvalidArgument => write!(formatter, "invalid argument"),
             VfsError::InvalidPath => write!(formatter, "invalid path"),
             VfsError::InvalidOffset => write!(formatter, "invalid file offset"),
             VfsError::Corrupt => write!(formatter, "corrupt filesystem"),

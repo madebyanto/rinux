@@ -16,7 +16,10 @@ use ::alloc::string::String;
 use ::alloc::vec;
 use ::alloc::vec::Vec;
 use bitmap::Bitmap;
-use dir::{init_empty_dir_block, insert_dir_entry};
+use dir::{
+    init_dot_dotdot_block, init_empty_dir_block, insert_dir_entry, remove_dir_entry,
+    rename_dir_entry_in_place,
+};
 use inode::{read_pointer, write_pointer};
 use structs::{
     parse_inode, Inode, EXT2_INDEX_FL, GROUP_DESCRIPTOR_SIZE, SUPERBLOCK_OFFSET,
@@ -26,7 +29,9 @@ use structs::{
 pub const MAX_PATH: usize = 256;
 const CACHE_ENTRIES: usize = 16;
 const S_IFREG: u16 = 0x8000;
+const S_IFDIR: u16 = 0x4000;
 const EXT2_FT_REG_FILE: u8 = 1;
+const EXT2_FT_DIR: u8 = 2;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +57,9 @@ pub enum Ext2Error {
     NotFound,
     NotDirectory,
     NotFile,
+    NotEmpty,
+    Busy,
+    InvalidArgument,
     CorruptDirectory,
     CorruptInode,
     InvalidBlock,
@@ -92,6 +100,9 @@ impl core::fmt::Display for Ext2Error {
             Ext2Error::NotFound => write!(formatter, "not found"),
             Ext2Error::NotDirectory => write!(formatter, "not a directory"),
             Ext2Error::NotFile => write!(formatter, "not a regular file"),
+            Ext2Error::NotEmpty => write!(formatter, "directory not empty"),
+            Ext2Error::Busy => write!(formatter, "resource busy"),
+            Ext2Error::InvalidArgument => write!(formatter, "invalid argument"),
             Ext2Error::CorruptDirectory => write!(formatter, "corrupt ext2 directory"),
             Ext2Error::CorruptInode => write!(formatter, "corrupt ext2 inode"),
             Ext2Error::InvalidBlock => write!(formatter, "invalid ext2 file block"),
@@ -112,6 +123,9 @@ impl From<Ext2Error> for VfsError {
             Ext2Error::NotFound => VfsError::NotFound,
             Ext2Error::NotDirectory => VfsError::NotDirectory,
             Ext2Error::NotFile => VfsError::NotFile,
+            Ext2Error::NotEmpty => VfsError::NotEmpty,
+            Ext2Error::Busy => VfsError::Busy,
+            Ext2Error::InvalidArgument => VfsError::InvalidArgument,
             Ext2Error::InvalidPath => VfsError::InvalidPath,
             Ext2Error::UnsupportedFeature { .. }
             | Ext2Error::UnsupportedBlockSize(_)
@@ -624,6 +638,11 @@ impl<D: BlockDevice> Ext2<D> {
         })
     }
 
+    /// `i_links_count`, exposed so tests can check directory accounting.
+    pub fn links_count(&mut self, node: NodeId) -> Result<u16, Ext2Error> {
+        Ok(self.read_inode(node)?.links_count())
+    }
+
     /// Resolve `path`, creating the final component when `O_CREAT` is set.
     pub fn open_flags(&mut self, path: &str, flags: u32, mode: u16) -> Result<NodeId, Ext2Error> {
         if path.len() > MAX_PATH {
@@ -761,6 +780,491 @@ impl<D: BlockDevice> Ext2<D> {
             return Err(Ext2Error::Unsupported);
         }
         Ok(())
+    }
+
+    /// Create a directory in `path`, adding its `.`/`..` block and a parent
+    /// entry. A failed insertion rolls back the block, inode and group counts.
+    pub fn mkdir(&mut self, path: &str, mode: u16) -> Result<NodeId, Ext2Error> {
+        self.require_writable()?;
+        let (parent_path, name) = split_path(path)?;
+        check_namespace_name(name)?;
+        validate_name(name)?;
+        let parent = self.lookup(parent_path)?;
+        let mut parent_inode = self.read_inode(parent)?;
+        self.check_directory_mutable(&parent_inode)?;
+        match self.find_entry(&parent_inode, name) {
+            Ok(_) => return Err(Ext2Error::AlreadyExists),
+            Err(Ext2Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+
+        let group = layout::inode_location(&self.superblock, parent)
+            .map(|(group, _)| group as usize)
+            .unwrap_or(0);
+        let child = self.allocate_inode(group, true)?;
+        let mut inode = match Inode::empty(child, self.superblock.inode_size() as usize) {
+            Ok(inode) => inode,
+            Err(error) => {
+                let _ = self.free_inode(child, true);
+                return Err(error);
+            }
+        };
+        inode.set_mode(S_IFDIR | (mode & 0o7777));
+        inode.set_links_count(2);
+        let now = self.now();
+        inode.set_atime(now);
+        inode.set_mtime(now);
+        inode.set_ctime(now);
+        let block_size = self.superblock.block_size();
+        if let Err(error) = inode.set_size(block_size as u64, self.superblock.has_large_file()) {
+            let _ = self.free_inode(child, true);
+            return Err(error);
+        }
+        let block = match self.allocate_block(group) {
+            Ok(block) => block,
+            Err(error) => {
+                let _ = self.free_inode(child, true);
+                return Err(error);
+            }
+        };
+        let mut data = vec![0u8; block_size];
+        init_dot_dotdot_block(&mut data, child, parent, self.has_filetype);
+        if let Err(error) = self.write_block(block as u64, &data) {
+            let _ = self.free_block(block);
+            let _ = self.free_inode(child, true);
+            return Err(error);
+        }
+        inode.set_block(0, block);
+        inode.add_sectors(self.sectors_per_block());
+        if let Err(error) = self.write_inode(&mut inode) {
+            let _ = self.free_block(block);
+            let _ = self.free_inode(child, true);
+            return Err(error);
+        }
+        if let Err(error) = self.add_dir_entry(&mut parent_inode, name, child, EXT2_FT_DIR) {
+            let _ = self.free_block(block);
+            let _ = self.free_inode(child, true);
+            return Err(error);
+        }
+        let links = parent_inode.links_count().saturating_add(1);
+        parent_inode.set_links_count(links);
+        if let Err(error) = self.write_inode(&mut parent_inode) {
+            // Undo the entry and the freshly allocated directory.
+            let _ = self.remove_entry(&mut parent_inode, name);
+            let _ = self.free_inode_contents(&mut inode);
+            let _ = self.free_inode(child, true);
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    /// Remove an empty directory, freeing its block and inode.
+    pub fn rmdir(&mut self, path: &str) -> Result<(), Ext2Error> {
+        self.require_writable()?;
+        if path == "/" {
+            return Err(Ext2Error::Busy);
+        }
+        let (parent_path, name) = split_path(path)?;
+        check_namespace_name(name)?;
+        validate_name(name)?;
+        let target = self.lookup(path)?;
+        if target == 2 {
+            return Err(Ext2Error::Busy);
+        }
+        let mut inode = self.read_inode(target)?;
+        if !inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        if !self.is_dir_empty(target)? {
+            return Err(Ext2Error::NotEmpty);
+        }
+        let parent = self.lookup(parent_path)?;
+        let mut parent_inode = self.read_inode(parent)?;
+        self.check_directory_mutable(&parent_inode)?;
+        let removed = self.remove_entry(&mut parent_inode, name)?;
+        if removed != target {
+            return Err(Ext2Error::CorruptDirectory);
+        }
+        self.free_inode_contents(&mut inode)?;
+        inode.set_links_count(0);
+        inode.set_dtime(self.now());
+        self.write_inode(&mut inode)?;
+        self.free_inode(target, true)?;
+        let links = parent_inode.links_count().saturating_sub(1);
+        parent_inode.set_links_count(links);
+        self.write_inode(&mut parent_inode)?;
+        Ok(())
+    }
+
+    /// Remove a non-directory entry. When the last link disappears the inode is
+    /// freed immediately unless `still_open` defers it to the final close.
+    pub fn unlink(&mut self, path: &str, still_open: bool) -> Result<NodeId, Ext2Error> {
+        self.require_writable()?;
+        if path == "/" {
+            return Err(Ext2Error::NotFile);
+        }
+        let (parent_path, name) = split_path(path)?;
+        check_namespace_name(name)?;
+        validate_name(name)?;
+        let target = self.lookup(path)?;
+        let mut inode = self.read_inode(target)?;
+        if inode.is_dir() {
+            return Err(Ext2Error::NotFile);
+        }
+        let parent = self.lookup(parent_path)?;
+        let mut parent_inode = self.read_inode(parent)?;
+        self.check_directory_mutable(&parent_inode)?;
+        let removed = self.remove_entry(&mut parent_inode, name)?;
+        if removed != target {
+            return Err(Ext2Error::CorruptDirectory);
+        }
+        let links = inode.links_count().saturating_sub(1);
+        inode.set_links_count(links);
+        if links == 0 && !still_open {
+            self.free_inode_contents(&mut inode)?;
+            inode.set_dtime(self.now());
+            self.write_inode(&mut inode)?;
+            self.free_inode(target, false)?;
+        } else {
+            // An open descriptor keeps reading the old blocks until the final
+            // close calls `release_unlinked_inode`.
+            self.write_inode(&mut inode)?;
+        }
+        Ok(target)
+    }
+
+    /// Finish the deletion of an inode whose link count reached zero while it
+    /// was still open. Linked inodes are left untouched.
+    pub fn release_unlinked_inode(&mut self, node: NodeId) -> Result<(), Ext2Error> {
+        if self.read_only {
+            return Ok(());
+        }
+        if !self.is_inode_allocated(node)? {
+            return Ok(());
+        }
+        let mut inode = self.read_inode(node)?;
+        if inode.links_count() != 0 {
+            return Ok(());
+        }
+        if inode.is_dir() {
+            return Err(Ext2Error::NotFile);
+        }
+        self.free_inode_contents(&mut inode)?;
+        inode.set_dtime(self.now());
+        self.write_inode(&mut inode)?;
+        self.free_inode(node, false)
+    }
+
+    /// Move `old_path` to `new_path`, replacing an existing destination when
+    /// POSIX allows it. `target_open` mirrors the open-descriptor deferral of
+    /// [`Self::unlink`] for a replaced regular file.
+    pub fn rename(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+        target_open: bool,
+    ) -> Result<(), Ext2Error> {
+        self.require_writable()?;
+        let (old_parent_path, old_name) = split_path(old_path)?;
+        let (new_parent_path, new_name) = split_path(new_path)?;
+        check_namespace_name(old_name)?;
+        check_namespace_name(new_name)?;
+        validate_name(old_name)?;
+        validate_name(new_name)?;
+
+        let old_node = self.lookup(old_path)?;
+        let new_node = match self.lookup(new_path) {
+            Ok(node) => Some(node),
+            Err(Ext2Error::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if new_node == Some(old_node) {
+            // POSIX: renaming a path to itself is a successful no-op.
+            return Ok(());
+        }
+
+        let mut old_inode = self.read_inode(old_node)?;
+        let old_parent = self.lookup(old_parent_path)?;
+        let new_parent = self.lookup(new_parent_path)?;
+        let mut old_parent_inode = self.read_inode(old_parent)?;
+        self.check_directory_mutable(&old_parent_inode)?;
+        let mut new_parent_inode = if new_parent == old_parent {
+            old_parent_inode.clone()
+        } else {
+            let inode = self.read_inode(new_parent)?;
+            self.check_directory_mutable(&inode)?;
+            inode
+        };
+        if old_inode.is_dir() && self.is_descendant_or_self(new_parent, old_node)? {
+            return Err(Ext2Error::InvalidArgument);
+        }
+
+        let mut replaced_is_dir = false;
+        let mut replaced_file_type = EXT2_FT_REG_FILE;
+        if let Some(target) = new_node {
+            let target_inode = self.read_inode(target)?;
+            if old_inode.is_dir() && !target_inode.is_dir() {
+                return Err(Ext2Error::NotDirectory);
+            }
+            if !old_inode.is_dir() && target_inode.is_dir() {
+                return Err(Ext2Error::NotFile);
+            }
+            if target_inode.is_dir() {
+                if !self.is_dir_empty(target)? {
+                    return Err(Ext2Error::NotEmpty);
+                }
+                replaced_is_dir = true;
+                replaced_file_type = EXT2_FT_DIR;
+            }
+        }
+
+        if old_parent == new_parent {
+            if let Some(target) = new_node {
+                let removed = self.remove_entry(&mut new_parent_inode, new_name)?;
+                if removed != target {
+                    return Err(Ext2Error::CorruptDirectory);
+                }
+            }
+            if !self.rename_entry_in_dir(&mut new_parent_inode, old_name, new_name)? {
+                let removed = self.remove_entry(&mut new_parent_inode, old_name)?;
+                if removed != old_node {
+                    return Err(Ext2Error::CorruptDirectory);
+                }
+                if let Err(error) = self.add_dir_entry(
+                    &mut new_parent_inode,
+                    new_name,
+                    old_node,
+                    inode_file_type(&old_inode),
+                ) {
+                    if let Some(target) = new_node {
+                        let _ = self.add_dir_entry(
+                            &mut new_parent_inode,
+                            new_name,
+                            target,
+                            replaced_file_type,
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+            if let Some(target) = new_node {
+                self.finalize_replaced(
+                    target,
+                    replaced_is_dir,
+                    target_open,
+                    &mut new_parent_inode,
+                )?;
+            }
+            self.write_inode(&mut new_parent_inode)?;
+            return Ok(());
+        }
+
+        // Different parents. Remove the destination entry but keep its inode
+        // and blocks until the move is committed, so insertion errors can be
+        // rolled back by putting the entry back.
+        if let Some(target) = new_node {
+            let removed = self.remove_entry(&mut new_parent_inode, new_name)?;
+            if removed != target {
+                return Err(Ext2Error::CorruptDirectory);
+            }
+        }
+        if let Err(error) =
+            self.add_dir_entry(&mut new_parent_inode, new_name, old_node, inode_file_type(&old_inode))
+        {
+            if let Some(target) = new_node {
+                let _ = self.add_dir_entry(
+                    &mut new_parent_inode,
+                    new_name,
+                    target,
+                    replaced_file_type,
+                );
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.remove_entry(&mut old_parent_inode, old_name) {
+            let _ = self.remove_entry(&mut new_parent_inode, new_name);
+            if let Some(target) = new_node {
+                let _ = self.add_dir_entry(
+                    &mut new_parent_inode,
+                    new_name,
+                    target,
+                    replaced_file_type,
+                );
+            }
+            return Err(error);
+        }
+
+        if let Some(target) = new_node {
+            self.finalize_replaced(target, replaced_is_dir, target_open, &mut new_parent_inode)?;
+        }
+        if old_inode.is_dir() {
+            let old_links = old_parent_inode.links_count().saturating_sub(1);
+            old_parent_inode.set_links_count(old_links);
+            self.write_inode(&mut old_parent_inode)?;
+            let new_links = new_parent_inode.links_count().saturating_add(1);
+            new_parent_inode.set_links_count(new_links);
+            self.write_inode(&mut new_parent_inode)?;
+            self.update_dotdot(&mut old_inode, new_parent)?;
+        } else {
+            self.write_inode(&mut old_parent_inode)?;
+            self.write_inode(&mut new_parent_inode)?;
+        }
+        Ok(())
+    }
+
+    fn is_dir_empty(&mut self, node: NodeId) -> Result<bool, Ext2Error> {
+        let mut cursor = DirCursor::new();
+        while let Some(entry) = self.read_dir(node, &mut cursor)? {
+            if entry.name != "." && entry.name != ".." {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether `node` is `ancestor` itself or one of its descendants.
+    fn is_descendant_or_self(
+        &mut self,
+        node: NodeId,
+        ancestor: NodeId,
+    ) -> Result<bool, Ext2Error> {
+        let mut current = node;
+        let limit = self.superblock.inodes_count().max(1);
+        for _ in 0..limit {
+            if current == ancestor {
+                return Ok(true);
+            }
+            if current == 2 {
+                break;
+            }
+            let inode = self.read_inode(current)?;
+            if !inode.is_dir() {
+                break;
+            }
+            current = self.find_entry(&inode, "..")?;
+        }
+        Ok(false)
+    }
+
+    fn find_entry_location(
+        &mut self,
+        directory: &Inode,
+        name: &str,
+    ) -> Result<(u64, usize, usize), Ext2Error> {
+        if !directory.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        let block_size = self.superblock.block_size() as u64;
+        let block_count = (directory.size + block_size - 1) / block_size;
+        let has_filetype = self.has_filetype;
+        for logical in 0..block_count {
+            let disk = self.map_block(directory, logical)?;
+            if disk == 0 {
+                return Err(Ext2Error::CorruptDirectory);
+            }
+            let data = self.read_block_vec(disk as u64)?;
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let (raw, next) = parse_dir_entry(&data, offset, has_filetype)?;
+                if raw.inode != 0 {
+                    let candidate = core::str::from_utf8(
+                        &data[raw.name_start..raw.name_start + raw.name_len],
+                    )
+                    .map_err(|_| Ext2Error::CorruptDirectory)?;
+                    if candidate == name {
+                        return Ok((disk as u64, offset, next - offset));
+                    }
+                }
+                if next >= data.len() {
+                    break;
+                }
+                offset = next;
+            }
+        }
+        Err(Ext2Error::NotFound)
+    }
+
+    /// Remove `name` from `directory`, merging the record into its predecessor.
+    /// The target inode and its blocks are left untouched for the caller.
+    fn remove_entry(&mut self, directory: &mut Inode, name: &str) -> Result<u32, Ext2Error> {
+        self.require_writable()?;
+        self.check_directory_mutable(directory)?;
+        let (disk, offset, _) = self.find_entry_location(directory, name)?;
+        let mut data = self.read_block_vec(disk)?;
+        let (raw, _) = parse_dir_entry(&data, offset, self.has_filetype)?;
+        if raw.inode == 0 {
+            return Err(Ext2Error::NotFound);
+        }
+        remove_dir_entry(&mut data, offset, self.has_filetype)?;
+        self.write_block(disk, &data)?;
+        self.touch_inode(directory)?;
+        Ok(raw.inode)
+    }
+
+    fn rename_entry_in_dir(
+        &mut self,
+        directory: &mut Inode,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<bool, Ext2Error> {
+        let (disk, offset, _) = self.find_entry_location(directory, old_name)?;
+        let mut data = self.read_block_vec(disk)?;
+        if !rename_dir_entry_in_place(
+            &mut data,
+            offset,
+            new_name.as_bytes(),
+            self.has_filetype,
+        ) {
+            return Ok(false);
+        }
+        self.write_block(disk, &data)?;
+        self.touch_inode(directory)?;
+        Ok(true)
+    }
+
+    fn update_dotdot(&mut self, directory: &mut Inode, parent: NodeId) -> Result<(), Ext2Error> {
+        let (disk, offset, _) = self.find_entry_location(directory, "..")?;
+        let mut data = self.read_block_vec(disk)?;
+        dir::set_entry_inode(&mut data, offset, parent)?;
+        self.write_block(disk, &data)?;
+        self.touch_inode(directory)
+    }
+
+    /// Free every data and indirect block owned by `inode` and zero its size.
+    fn free_inode_contents(&mut self, inode: &mut Inode) -> Result<(), Ext2Error> {
+        self.free_blocks_from(inode, 0)?;
+        inode.set_size(0, self.superblock.has_large_file())
+    }
+
+    fn finalize_replaced(
+        &mut self,
+        target: NodeId,
+        is_dir: bool,
+        still_open: bool,
+        parent: &mut Inode,
+    ) -> Result<(), Ext2Error> {
+        let mut inode = self.read_inode(target)?;
+        if is_dir {
+            self.free_inode_contents(&mut inode)?;
+            inode.set_links_count(0);
+            inode.set_dtime(self.now());
+            self.write_inode(&mut inode)?;
+            self.free_inode(target, true)?;
+            let links = parent.links_count().saturating_sub(1);
+            parent.set_links_count(links);
+            self.touch_inode(parent)
+        } else {
+            let links = inode.links_count().saturating_sub(1);
+            inode.set_links_count(links);
+            if links == 0 && !still_open {
+                self.free_inode_contents(&mut inode)?;
+                inode.set_dtime(self.now());
+                self.write_inode(&mut inode)?;
+                self.free_inode(target, false)
+            } else {
+                self.write_inode(&mut inode)
+            }
+        }
     }
 
     pub fn read_file(
@@ -1439,7 +1943,9 @@ impl<D: BlockDevice> Ext2<D> {
     }
 }
 
-fn split_parent(path: &str) -> Result<(&str, &str), Ext2Error> {
+/// Split a path into its parent and final component, without applying the
+/// dot-entry rules that namespace mutators need to distinguish.
+fn split_path(path: &str) -> Result<(&str, &str), Ext2Error> {
     if path.is_empty() || path.ends_with('/') {
         return Err(Ext2Error::InvalidPath);
     }
@@ -1450,10 +1956,33 @@ fn split_parent(path: &str) -> Result<(&str, &str), Ext2Error> {
         }
         None => ("/", path),
     };
-    if name.is_empty() || name == "." || name == ".." {
+    if name.is_empty() {
         return Err(Ext2Error::InvalidPath);
     }
     Ok((parent, name))
+}
+
+fn split_parent(path: &str) -> Result<(&str, &str), Ext2Error> {
+    let (parent, name) = split_path(path)?;
+    check_namespace_name(name)?;
+    Ok((parent, name))
+}
+
+/// `.` and `..` are never valid final components for a namespace mutation.
+fn check_namespace_name(name: &str) -> Result<(), Ext2Error> {
+    match name {
+        "." => Err(Ext2Error::InvalidArgument),
+        ".." => Err(Ext2Error::Busy),
+        _ => Ok(()),
+    }
+}
+
+fn inode_file_type(inode: &Inode) -> u8 {
+    if inode.is_dir() {
+        EXT2_FT_DIR
+    } else {
+        EXT2_FT_REG_FILE
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), Ext2Error> {
@@ -1516,6 +2045,31 @@ impl<D: BlockDevice + Send> FileSystem for Ext2<D> {
         mode: u16,
     ) -> Result<NodeId, VfsError> {
         self.open_flags(path, flags, mode).map_err(VfsError::from)
+    }
+
+    fn mkdir(&mut self, path: &str, mode: u16) -> Result<NodeId, VfsError> {
+        Ext2::mkdir(self, path, mode).map_err(VfsError::from)
+    }
+
+    fn rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+        Ext2::rmdir(self, path).map_err(VfsError::from)
+    }
+
+    fn unlink(&mut self, path: &str, still_open: bool) -> Result<NodeId, VfsError> {
+        Ext2::unlink(self, path, still_open).map_err(VfsError::from)
+    }
+
+    fn rename(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+        target_open: bool,
+    ) -> Result<(), VfsError> {
+        Ext2::rename(self, old_path, new_path, target_open).map_err(VfsError::from)
+    }
+
+    fn release_unlinked(&mut self, node: NodeId) -> Result<(), VfsError> {
+        Ext2::release_unlinked_inode(self, node).map_err(VfsError::from)
     }
 
     fn stat(&mut self, node: NodeId) -> Result<Stat, VfsError> {

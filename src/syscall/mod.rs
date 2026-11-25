@@ -76,6 +76,10 @@ fn dispatch(frame: &mut SyscallFrame) -> u64 {
         Some(abi::Syscall::Kill) => sys_kill(arg0, arg1),
         Some(abi::Syscall::Truncate) => sys_truncate(arg0, arg1),
         Some(abi::Syscall::Ftruncate) => sys_ftruncate(arg0, arg1),
+        Some(abi::Syscall::Rename) => sys_rename(arg0, arg1),
+        Some(abi::Syscall::Mkdir) => sys_mkdir(arg0, arg1),
+        Some(abi::Syscall::Rmdir) => sys_rmdir(arg0),
+        Some(abi::Syscall::Unlink) => sys_unlink(arg0),
         Some(abi::Syscall::Sync) => sys_sync(),
         Some(abi::Syscall::Exit) => sys_exit(arg0),
         None => abi::errno(abi::ENOSYS),
@@ -311,13 +315,21 @@ fn sys_open(path: u64, flags: u64, mode: u64) -> u64 {
     };
     match scheduler::current_open_fd(file.node, flags) {
         Ok(fd) => fd as u64,
-        Err(error) => fd_errno(error),
+        Err(error) => {
+            // The open count was raised before the descriptor was installed.
+            let _ = fs::close_node(file.node);
+            fd_errno(error)
+        }
     }
 }
 
 fn sys_close(fd: u64) -> u64 {
     match scheduler::current_close_fd(fd as u32) {
-        Ok(()) => 0,
+        Ok(Some(node)) => match fs::close_node(node) {
+            Ok(()) => 0,
+            Err(error) => vfs_errno(error),
+        },
+        Ok(None) => 0,
         Err(error) => fd_errno(error),
     }
 }
@@ -393,6 +405,59 @@ fn sys_ftruncate(fd: u64, length: u64) -> u64 {
         return abi::errno(abi::EINVAL);
     }
     match fs::truncate_node(file.node, length) {
+        Ok(()) => 0,
+        Err(error) => vfs_errno(error),
+    }
+}
+
+fn sys_mkdir(path: u64, mode: u64) -> u64 {
+    let path = match user_path(path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mode = if mode == 0 {
+        0o755
+    } else {
+        (mode as u16) & 0o7777
+    };
+    match fs::mkdir(&path, mode) {
+        Ok(_) => 0,
+        Err(error) => vfs_errno(error),
+    }
+}
+
+fn sys_rmdir(path: u64) -> u64 {
+    let path = match user_path(path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match fs::rmdir(&path) {
+        Ok(()) => 0,
+        Err(error) => vfs_errno(error),
+    }
+}
+
+fn sys_unlink(path: u64) -> u64 {
+    let path = match user_path(path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match fs::unlink(&path) {
+        Ok(_) => 0,
+        Err(error) => vfs_errno(error),
+    }
+}
+
+fn sys_rename(old_path: u64, new_path: u64) -> u64 {
+    let old_path = match user_path(old_path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let new_path = match user_path(new_path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match fs::rename(&old_path, &new_path) {
         Ok(()) => 0,
         Err(error) => vfs_errno(error),
     }
@@ -857,6 +922,9 @@ fn vfs_errno(error: VfsError) -> u64 {
         VfsError::NotDirectory => abi::errno(abi::ENOTDIR),
         VfsError::NotFile => abi::errno(abi::EISDIR),
         VfsError::AlreadyExists => abi::errno(abi::EEXIST),
+        VfsError::NotEmpty => abi::errno(abi::ENOTEMPTY),
+        VfsError::Busy => abi::errno(abi::EBUSY),
+        VfsError::InvalidArgument => abi::errno(abi::EINVAL),
         VfsError::InvalidPath => abi::errno(abi::EINVAL),
         VfsError::InvalidOffset => abi::errno(abi::EINVAL),
         VfsError::Corrupt => abi::errno(abi::EIO),

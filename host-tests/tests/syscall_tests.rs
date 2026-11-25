@@ -2,12 +2,12 @@ use core::mem::size_of;
 
 use hosttest::syscall_abi::{
     classify, errno, validate_open_flags, KernelSigAction, OpenAccess, Syscall, E2BIG, EBADF,
-    ECHILD, EEXIST, EFAULT, EINTR, EINVAL, ENOMEM, ENOSYS, ENOENT, EOPNOTSUPP, EPERM, EROFS,
-    ESRCH, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DSYNC, O_EXCL, O_NONBLOCK, O_RDONLY,
-    O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, SIGSET_SIZE, SYS_CLOSE, SYS_EXECVE, SYS_EXIT, SYS_FORK,
-    SYS_FTRUNCATE, SYS_GETPID, SYS_KILL, SYS_LSEEK, SYS_OPEN, SYS_READ, SYS_RT_SIGACTION,
-    SYS_RT_SIGPROCMASK, SYS_RT_SIGRETURN, SYS_STAT, SYS_SYNC, SYS_TRUNCATE, SYS_WAITPID,
-    SYS_WRITE,
+    EBUSY, ECHILD, EEXIST, EFAULT, EINTR, EINVAL, ENOMEM, ENOSYS, ENOENT, ENOTEMPTY, EOPNOTSUPP,
+    EPERM, EROFS, ESRCH, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DSYNC, O_EXCL, O_NONBLOCK,
+    O_RDONLY, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, SIGSET_SIZE, SYS_CLOSE, SYS_EXECVE, SYS_EXIT,
+    SYS_FORK, SYS_FTRUNCATE, SYS_GETPID, SYS_KILL, SYS_LSEEK, SYS_MKDIR, SYS_OPEN, SYS_READ,
+    SYS_RENAME, SYS_RMDIR, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_RT_SIGRETURN, SYS_STAT,
+    SYS_SYNC, SYS_TRUNCATE, SYS_UNLINK, SYS_WAITPID, SYS_WRITE,
 };
 
 #[test]
@@ -28,6 +28,10 @@ fn classifies_linux_syscall_numbers() {
     assert_eq!(classify(SYS_GETPID), Some(Syscall::GetPid));
     assert_eq!(classify(SYS_TRUNCATE), Some(Syscall::Truncate));
     assert_eq!(classify(SYS_FTRUNCATE), Some(Syscall::Ftruncate));
+    assert_eq!(classify(SYS_RENAME), Some(Syscall::Rename));
+    assert_eq!(classify(SYS_MKDIR), Some(Syscall::Mkdir));
+    assert_eq!(classify(SYS_RMDIR), Some(Syscall::Rmdir));
+    assert_eq!(classify(SYS_UNLINK), Some(Syscall::Unlink));
     assert_eq!(classify(SYS_SYNC), Some(Syscall::Sync));
     assert_eq!(classify(SYS_EXIT), Some(Syscall::Exit));
 }
@@ -65,6 +69,18 @@ fn truncate_and_sync_use_linux_numbers() {
     assert_eq!(O_APPEND, 0o2000);
     assert_eq!(EEXIST, 17);
     assert_eq!(EOPNOTSUPP, 95);
+}
+
+#[test]
+fn namespace_syscalls_use_linux_numbers_and_errnos() {
+    assert_eq!(SYS_RENAME, 82);
+    assert_eq!(SYS_MKDIR, 83);
+    assert_eq!(SYS_RMDIR, 84);
+    assert_eq!(SYS_UNLINK, 87);
+    assert_eq!(EBUSY, 16);
+    assert_eq!(ENOTEMPTY, 39);
+    assert_eq!(errno(ENOTEMPTY), (-(ENOTEMPTY as i64)) as u64);
+    assert_eq!(errno(EBUSY), (-(EBUSY as i64)) as u64);
 }
 
 #[test]

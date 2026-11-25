@@ -1,6 +1,7 @@
 use super::pipe::PipeEnd;
 use super::vfs::{File, NodeId};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 
 pub const MAX_FDS: usize = 16;
@@ -138,6 +139,18 @@ impl FdTable {
             return Err(FdError::InvalidFd);
         }
         self.take(fd)
+    }
+
+    /// One entry per open file descriptor, used by `fork` to duplicate the
+    /// VFS open counts and by exit to release them.
+    pub fn file_nodes(&self) -> Vec<NodeId> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Some(FdEntry::File(file)) => Some(file.node),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn entry(&self, fd: u32) -> Result<FdEntry, FdError> {

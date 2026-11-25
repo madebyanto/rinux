@@ -397,6 +397,10 @@ impl Inode {
         put_u16(&mut self.raw, 26, links);
     }
 
+    pub(crate) fn links_count(&self) -> u16 {
+        u16_at(&self.raw, 26)
+    }
+
     /// Re-apply the decoded fields to the preserved raw bytes before writeback.
     pub(crate) fn sync_raw(&mut self, large_file: bool) -> Result<(), Ext2Error> {
         if !large_file && self.size > u32::MAX as u64 {

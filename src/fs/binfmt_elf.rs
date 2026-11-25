@@ -128,22 +128,26 @@ pub fn open_executable(path: &str) -> Result<ExecFile, LoadError> {
         return Err(LoadError::FileTooLarge);
     }
     let file = crate::fs::open(path)?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(size)
-        .map_err(|_| LoadError::OutOfMemory)?;
-    data.resize(size, 0);
-    let mut offset = 0;
-    while offset < size {
-        let count = crate::fs::read_node(file.node, offset as u64, &mut data[offset..])?;
-        if count == 0 {
-            break;
+    let result = (|| {
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|_| LoadError::OutOfMemory)?;
+        data.resize(size, 0);
+        let mut offset = 0;
+        while offset < size {
+            let count = crate::fs::read_node(file.node, offset as u64, &mut data[offset..])?;
+            if count == 0 {
+                break;
+            }
+            offset += count;
         }
-        offset += count;
-    }
-    if offset != size {
-        return Err(LoadError::ReadFailed);
-    }
-    Ok(ExecFile { data })
+        if offset != size {
+            return Err(LoadError::ReadFailed);
+        }
+        Ok(ExecFile { data })
+    })();
+    let _ = crate::fs::close_node(file.node);
+    result
 }
 
 /// Pipeline stage 3: validate the ELF headers and load segments.

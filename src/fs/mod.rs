@@ -195,7 +195,48 @@ pub fn truncate_path(path: &str, size: u64) -> Result<(), VfsError> {
     let mut guard = VFS.lock();
     let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
     let file = vfs.open(path)?;
-    vfs.truncate(file.node, size)
+    let result = vfs.truncate(file.node, size);
+    let _ = vfs.close(file.node);
+    result
+}
+
+pub fn mkdir(path: &str, mode: u16) -> Result<NodeId, VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.mkdir(path, mode)
+}
+
+pub fn rmdir(path: &str) -> Result<(), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.rmdir(path)
+}
+
+pub fn unlink(path: &str) -> Result<NodeId, VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.unlink(path)
+}
+
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.rename(old_path, new_path)
+}
+
+/// Account for a descriptor inherited by `fork` or copied by `dup`.
+pub fn retain_node(node: NodeId) -> Result<(), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.retain(node);
+    Ok(())
+}
+
+/// Release one descriptor, finishing a deferred unlink on the final close.
+pub fn close_node(node: NodeId) -> Result<(), VfsError> {
+    let mut guard = VFS.lock();
+    let vfs = guard.as_mut().ok_or(VfsError::NotMounted)?;
+    vfs.close(node)
 }
 
 /// Flush dirty metadata and mark the superblock clean.

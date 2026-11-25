@@ -426,6 +426,12 @@ pub fn spawn_init(entry: TaskEntry) -> Result<Pid, SpawnError> {
 }
 
 pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
+    // Mirror the parent's open inodes for the child before it can be scheduled.
+    // The VFS lock must not be taken while holding the scheduler lock.
+    let inherited = current_file_nodes()?;
+    for node in &inherited {
+        let _ = crate::fs::retain_node(*node);
+    }
     let mut discarded: Option<Process> = None;
     let result = cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
@@ -468,6 +474,12 @@ pub fn fork_current(frame: &SyscallFrame) -> Result<Pid, ForkError> {
         Ok(pid)
     });
     drop(discarded);
+    if result.is_err() {
+        // The child never came to life; drop the references taken for it.
+        for node in inherited {
+            let _ = crate::fs::close_node(node);
+        }
+    }
     result
 }
 
@@ -982,7 +994,9 @@ pub fn current_open_fd(node: u32, flags: u32) -> Result<u32, FdError> {
     })
 }
 
-pub fn current_close_fd(fd: u32) -> Result<(), FdError> {
+/// Closes `fd` and returns the inode when it was a file descriptor, so the
+/// caller can release the VFS open count (and any deferred unlink).
+pub fn current_close_fd(fd: u32) -> Result<Option<u32>, FdError> {
     let removed = cpu::without_interrupts(|| {
         let mut guard = SCHEDULER.lock();
         let scheduler = guard.as_mut().ok_or(FdError::NoProcess)?;
@@ -990,10 +1004,26 @@ pub fn current_close_fd(fd: u32) -> Result<(), FdError> {
         let process = scheduler.process_mut(pid).ok_or(FdError::NoProcess)?;
         process.fds.close(fd)
     })?;
+    let node = match &removed {
+        FdEntry::File(file) => Some(file.node),
+        _ => None,
+    };
     // Dropping a pipe endpoint may wake blocked peers, which takes the
     // scheduler lock again. Never run that destructor under the lock.
     drop(removed);
-    Ok(())
+    Ok(node)
+}
+
+/// Inodes of every open file descriptor of the running process. `fork`
+/// duplicates these counts for the child.
+fn current_file_nodes() -> Result<alloc::vec::Vec<u32>, ForkError> {
+    cpu::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let scheduler = guard.as_ref().ok_or(ForkError::NoCurrent)?;
+        let pid = scheduler.current.ok_or(ForkError::NoCurrent)?;
+        let process = scheduler.process(pid).ok_or(ForkError::NoCurrent)?;
+        Ok(process.fds.file_nodes())
+    })
 }
 
 /// Installs both ends of a new pipe and returns their descriptors.
@@ -1310,7 +1340,16 @@ fn exit_current_status(status: ExitStatus) -> ! {
     }
     // Pipe endpoints (and any other owned descriptors) are released here,
     // where waking blocked peers cannot re-enter a held scheduler lock.
+    let released_nodes = orphaned_fds
+        .as_ref()
+        .map(|fds| fds.file_nodes())
+        .unwrap_or_default();
     drop(orphaned_fds);
+    // Closing the descriptors may finish a deferred unlink. The VFS lock is
+    // taken only after the scheduler lock has been released.
+    for node in released_nodes {
+        let _ = crate::fs::close_node(node);
+    }
     match status {
         ExitStatus::Exited(code) => crate::kprintln!("process exited with code {}", code),
         ExitStatus::Signaled(signal) => {

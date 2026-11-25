@@ -18,6 +18,10 @@ pub const SYS_WAITPID: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_TRUNCATE: u64 = 76;
 pub const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_RENAME: u64 = 82;
+pub const SYS_MKDIR: u64 = 83;
+pub const SYS_RMDIR: u64 = 84;
+pub const SYS_UNLINK: u64 = 87;
 pub const SYS_SYNC: u64 = 162;
 
 pub const EPERM: i64 = 1;
@@ -33,6 +37,7 @@ pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;
 pub const EACCES: i64 = 13;
 pub const EFAULT: i64 = 14;
+pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
 pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
@@ -41,6 +46,7 @@ pub const ENFILE: i64 = 23;
 pub const EMFILE: i64 = 24;
 pub const EFBIG: i64 = 27;
 pub const ENOSPC: i64 = 28;
+pub const ENOTEMPTY: i64 = 39;
 pub const EPIPE: i64 = 32;
 pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
@@ -107,6 +113,10 @@ pub enum Syscall {
     Kill,
     Truncate,
     Ftruncate,
+    Rename,
+    Mkdir,
+    Rmdir,
+    Unlink,
     Sync,
     Exit,
 }
@@ -130,6 +140,10 @@ pub fn classify(number: u64) -> Option<Syscall> {
         SYS_KILL => Some(Syscall::Kill),
         SYS_TRUNCATE => Some(Syscall::Truncate),
         SYS_FTRUNCATE => Some(Syscall::Ftruncate),
+        SYS_RENAME => Some(Syscall::Rename),
+        SYS_MKDIR => Some(Syscall::Mkdir),
+        SYS_RMDIR => Some(Syscall::Rmdir),
+        SYS_UNLINK => Some(Syscall::Unlink),
         SYS_SYNC => Some(Syscall::Sync),
         SYS_EXIT => Some(Syscall::Exit),
         _ => None,

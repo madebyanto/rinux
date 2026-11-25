@@ -228,6 +228,48 @@ pub fn remove_dir_entry(
     Ok(())
 }
 
+/// Rename the entry at `offset` in place when the new name still fits in the
+/// record's `rec_len`. The inode number and record length are preserved.
+pub fn rename_dir_entry_in_place(
+    block: &mut [u8],
+    offset: usize,
+    name: &[u8],
+    has_filetype: bool,
+) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    let Ok((entry, next)) = parse_dir_entry(block, offset, has_filetype) else {
+        return false;
+    };
+    if entry.inode == 0 {
+        return false;
+    }
+    let rec_len = next - offset;
+    let needed = (8 + name.len() + 3) & !3;
+    if needed > rec_len {
+        return false;
+    }
+    block[offset + 8..offset + rec_len].fill(0);
+    block[offset + 8..offset + 8 + name.len()].copy_from_slice(name);
+    if has_filetype {
+        block[offset + 6] = name.len() as u8;
+    } else {
+        block[offset + 6..offset + 8].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    }
+    true
+}
+
+/// Replace the inode number of the entry at `offset`, keeping its name and
+/// record length. Used to repoint a moved directory's `..` entry.
+pub fn set_entry_inode(block: &mut [u8], offset: usize, inode: u32) -> Result<(), Ext2Error> {
+    if inode == 0 || offset + 4 > block.len() {
+        return Err(Ext2Error::CorruptDirectory);
+    }
+    block[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
+    Ok(())
+}
+
 /// Initialise a directory block containing one free entry covering the block.
 pub fn init_empty_dir_block(block: &mut [u8]) {
     let block_size = block.len();

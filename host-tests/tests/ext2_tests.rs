@@ -392,6 +392,27 @@ fn fresh_rw() -> Ext2<RamDisk> {
     Ext2::mount_rw_with_clock(RamDisk::new(image()), || 1_700_000_000).unwrap()
 }
 
+fn create_file(filesystem: &mut Ext2<RamDisk>, path: &str, contents: &[u8]) -> u32 {
+    let node = filesystem
+        .open_flags(path, O_CREAT | O_RDWR, 0o644)
+        .unwrap();
+    if !contents.is_empty() {
+        assert_eq!(
+            filesystem.write_file(node, 0, contents).unwrap(),
+            contents.len()
+        );
+    }
+    node
+}
+
+fn read_all(filesystem: &mut Ext2<RamDisk>, node: u32) -> Vec<u8> {
+    let size = filesystem.stat_inode(node).unwrap().size as usize;
+    let mut data = vec![0u8; size];
+    let count = filesystem.read_file(node, 0, &mut data).unwrap();
+    data.truncate(count);
+    data
+}
+
 fn e2fsck(data: &[u8]) {
     let path = std::env::temp_dir().join(format!(
         "rinux-fsck-{}-{}",
@@ -1141,6 +1162,342 @@ fn allocates_on_four_kib_blocks_and_256_byte_inodes() {
     filesystem.free_inode(inode, true).unwrap();
     filesystem.sync().unwrap();
 
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn creates_and_removes_directories_with_accounting() {
+    let mut filesystem = fresh_rw();
+    let root = filesystem.lookup("/").unwrap();
+    let root_links = filesystem.links_count(root).unwrap();
+    let used_dirs = filesystem.group_descriptor(0).unwrap().used_dirs_count;
+    let free_inodes = filesystem.superblock().free_inodes_count();
+    let block_size = filesystem.superblock().block_size() as u64;
+
+    let dir = filesystem.mkdir("/made", 0o750).unwrap();
+    let stat = filesystem.stat_inode(dir).unwrap();
+    assert_eq!(stat.kind, FileType::Directory);
+    assert_eq!(stat.mode & 0o777, 0o750);
+    assert_eq!(stat.size, block_size);
+    assert_eq!(filesystem.links_count(dir).unwrap(), 2);
+    assert_eq!(filesystem.links_count(root).unwrap(), root_links + 1);
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().used_dirs_count,
+        used_dirs + 1
+    );
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes - 1);
+    assert_eq!(filesystem.lookup("/made/.").unwrap(), dir);
+    assert_eq!(filesystem.lookup("/made/..").unwrap(), root);
+
+    assert_eq!(
+        filesystem.mkdir("/made", 0o755),
+        Err(Ext2Error::AlreadyExists)
+    );
+    assert_eq!(
+        filesystem.mkdir("/hello.txt/x", 0o755),
+        Err(Ext2Error::NotDirectory)
+    );
+    assert_eq!(filesystem.mkdir("/.", 0o755), Err(Ext2Error::InvalidArgument));
+    assert_eq!(
+        filesystem.mkdir("/made/..", 0o755),
+        Err(Ext2Error::Busy)
+    );
+
+    let child = filesystem.mkdir("/made/child", 0o755).unwrap();
+    assert_eq!(filesystem.links_count(dir).unwrap(), 3);
+    let _file = create_file(&mut filesystem, "/made/child/file", b"data");
+    assert_eq!(filesystem.rmdir("/made"), Err(Ext2Error::NotEmpty));
+    filesystem.unlink("/made/child/file", false).unwrap();
+    filesystem.rmdir("/made/child").unwrap();
+    assert_eq!(filesystem.links_count(dir).unwrap(), 2);
+
+    let free_blocks = filesystem.superblock().free_blocks_count();
+    filesystem.rmdir("/made").unwrap();
+    assert_eq!(filesystem.superblock().free_blocks_count(), free_blocks + 1);
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes);
+    assert_eq!(filesystem.links_count(root).unwrap(), root_links);
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().used_dirs_count,
+        used_dirs
+    );
+    assert_eq!(filesystem.lookup("/made"), Err(Ext2Error::NotFound));
+    assert!(!filesystem.is_inode_allocated(dir).unwrap());
+    assert!(!filesystem.is_inode_allocated(child).unwrap());
+
+    assert_eq!(filesystem.rmdir("/"), Err(Ext2Error::Busy));
+    assert_eq!(
+        filesystem.rmdir("/hello.txt"),
+        Err(Ext2Error::NotDirectory)
+    );
+    assert_eq!(filesystem.rmdir("/missing"), Err(Ext2Error::NotFound));
+    assert_eq!(filesystem.rmdir("/."), Err(Ext2Error::InvalidArgument));
+    assert_eq!(filesystem.rmdir("/sub/.."), Err(Ext2Error::Busy));
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn unlink_frees_files_and_defers_open_inodes() {
+    let mut filesystem = fresh_rw();
+    let free_inodes = filesystem.superblock().free_inodes_count();
+
+    let node = create_file(&mut filesystem, "/victim.txt", b"victim data");
+    let free_blocks = filesystem.superblock().free_blocks_count();
+    assert_eq!(filesystem.unlink("/victim.txt", false).unwrap(), node);
+    assert_eq!(filesystem.lookup("/victim.txt"), Err(Ext2Error::NotFound));
+    assert!(!filesystem.is_inode_allocated(node).unwrap());
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes);
+    assert!(filesystem.superblock().free_blocks_count() > free_blocks);
+    assert_eq!(
+        filesystem.unlink("/sub", false),
+        Err(Ext2Error::NotFile)
+    );
+    assert_eq!(
+        filesystem.unlink("/missing", false),
+        Err(Ext2Error::NotFound)
+    );
+    assert_eq!(filesystem.unlink("/", false), Err(Ext2Error::NotFile));
+    assert_eq!(
+        filesystem.unlink("/victim.txt", false),
+        Err(Ext2Error::NotFound)
+    );
+
+    let open = create_file(&mut filesystem, "/open.txt", b"hello");
+    let open_free_inodes = filesystem.superblock().free_inodes_count();
+    assert_eq!(filesystem.unlink("/open.txt", true).unwrap(), open);
+    assert_eq!(filesystem.lookup("/open.txt"), Err(Ext2Error::NotFound));
+    assert!(filesystem.is_inode_allocated(open).unwrap());
+    assert_eq!(filesystem.links_count(open).unwrap(), 0);
+    assert_eq!(filesystem.superblock().free_inodes_count(), open_free_inodes);
+
+    let mut buffer = [0u8; 16];
+    let count = filesystem.read_file(open, 0, &mut buffer).unwrap();
+    assert_eq!(&buffer[..count], b"hello");
+    assert_eq!(filesystem.write_file(open, 5, b" world").unwrap(), 6);
+    assert_eq!(read_all(&mut filesystem, open), b"hello world");
+
+    filesystem.release_unlinked_inode(open).unwrap();
+    assert!(!filesystem.is_inode_allocated(open).unwrap());
+    assert_eq!(
+        filesystem.superblock().free_inodes_count(),
+        open_free_inodes + 1
+    );
+    // A second release is a no-op rather than a double free.
+    filesystem.release_unlinked_inode(open).unwrap();
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn vfs_defers_unlink_until_the_last_close() {
+    let mut vfs = Vfs::new(Box::new(fresh_rw()));
+    let mut file = vfs
+        .open_with_flags("/open.txt", O_CREAT | O_RDWR, 0o644)
+        .unwrap();
+    assert_eq!(vfs.open_count(file.node), 1);
+    assert_eq!(vfs.write(&mut file, b"hello").unwrap(), 5);
+
+    let replaced = vfs.unlink("/open.txt").unwrap();
+    assert_eq!(replaced, file.node);
+    assert!(matches!(vfs.stat("/open.txt"), Err(VfsError::NotFound)));
+    assert_eq!(vfs.open_count(file.node), 1);
+
+    let mut buffer = [0u8; 16];
+    let count = vfs.read_at(file.node, 0, &mut buffer).unwrap();
+    assert_eq!(&buffer[..count], b"hello");
+
+    vfs.close(file.node).unwrap();
+    assert_eq!(vfs.open_count(file.node), 0);
+    // Closing an already closed node is harmless.
+    vfs.close(file.node).unwrap();
+}
+
+#[test]
+fn rename_updates_names_in_place_and_moves_files() {
+    let mut filesystem = fresh_rw();
+    let root = filesystem.lookup("/").unwrap();
+    let node = create_file(&mut filesystem, "/rename-me.txt", b"renamed payload");
+    let root_size = filesystem.stat_inode(root).unwrap().size;
+    let root_links = filesystem.links_count(root).unwrap();
+
+    filesystem
+        .rename("/rename-me.txt", "/renamed.txt", false)
+        .unwrap();
+    assert_eq!(filesystem.lookup("/renamed.txt").unwrap(), node);
+    assert_eq!(filesystem.lookup("/rename-me.txt"), Err(Ext2Error::NotFound));
+    assert_eq!(read_all(&mut filesystem, node), b"renamed payload");
+    assert_eq!(filesystem.stat_inode(root).unwrap().size, root_size);
+    assert_eq!(filesystem.links_count(root).unwrap(), root_links);
+
+    // Renaming a path to itself is a successful no-op.
+    filesystem
+        .rename("/renamed.txt", "/renamed.txt", false)
+        .unwrap();
+    assert_eq!(filesystem.lookup("/renamed.txt").unwrap(), node);
+
+    assert_eq!(
+        filesystem.rename("/renamed.txt", "/sub/.", false),
+        Err(Ext2Error::InvalidArgument)
+    );
+    assert_eq!(
+        filesystem.rename("/renamed.txt", "/sub/..", false),
+        Err(Ext2Error::Busy)
+    );
+    assert_eq!(
+        filesystem.rename("/missing.txt", "/other.txt", false),
+        Err(Ext2Error::NotFound)
+    );
+
+    // A name that no longer fits forces a remove/insert fallback.
+    let long_name = format!("/{}.txt", "x".repeat(200));
+    filesystem
+        .rename("/renamed.txt", &long_name, false)
+        .unwrap();
+    assert_eq!(filesystem.lookup(&long_name).unwrap(), node);
+    assert_eq!(filesystem.lookup("/renamed.txt"), Err(Ext2Error::NotFound));
+    assert_eq!(read_all(&mut filesystem, node), b"renamed payload");
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn rename_moves_directories_between_parents() {
+    let mut filesystem = fresh_rw();
+    let root = filesystem.lookup("/").unwrap();
+    let src = filesystem.mkdir("/src", 0o755).unwrap();
+    let dst = filesystem.mkdir("/dst", 0o755).unwrap();
+    let child = filesystem.mkdir("/src/child", 0o755).unwrap();
+    let _inner = create_file(&mut filesystem, "/src/child/inner.txt", b"inner");
+
+    let root_links = filesystem.links_count(root).unwrap();
+    let src_links = filesystem.links_count(src).unwrap();
+    let dst_links = filesystem.links_count(dst).unwrap();
+
+    filesystem
+        .rename("/src/child", "/dst/moved", false)
+        .unwrap();
+    assert_eq!(filesystem.lookup("/src/child"), Err(Ext2Error::NotFound));
+    assert_eq!(filesystem.lookup("/dst/moved").unwrap(), child);
+    assert_eq!(filesystem.lookup("/dst/moved/..").unwrap(), dst);
+    assert_eq!(filesystem.links_count(src).unwrap(), src_links - 1);
+    assert_eq!(filesystem.links_count(dst).unwrap(), dst_links + 1);
+    assert_eq!(filesystem.links_count(root).unwrap(), root_links);
+    let moved_inner = filesystem.lookup("/dst/moved/inner.txt").unwrap();
+    assert_eq!(read_all(&mut filesystem, moved_inner), b"inner");
+
+    // Moving it back restores every link count and the parent entry.
+    filesystem
+        .rename("/dst/moved", "/src/child", false)
+        .unwrap();
+    assert_eq!(filesystem.lookup("/src/child").unwrap(), child);
+    assert_eq!(filesystem.lookup("/src/child/..").unwrap(), src);
+    assert_eq!(filesystem.links_count(src).unwrap(), src_links);
+    assert_eq!(filesystem.links_count(dst).unwrap(), dst_links);
+    assert_eq!(filesystem.links_count(root).unwrap(), root_links);
+
+    // Cross-directory file moves carry the inode without touching links.
+    let movable = create_file(&mut filesystem, "/src/movable.txt", b"cross");
+    filesystem
+        .rename("/src/movable.txt", "/moved-file.txt", false)
+        .unwrap();
+    assert_eq!(
+        filesystem.lookup("/src/movable.txt"),
+        Err(Ext2Error::NotFound)
+    );
+    assert_eq!(filesystem.lookup("/moved-file.txt").unwrap(), movable);
+    assert_eq!(read_all(&mut filesystem, movable), b"cross");
+    assert_eq!(filesystem.links_count(src).unwrap(), src_links);
+    assert_eq!(filesystem.links_count(root).unwrap(), root_links);
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn rename_replaces_targets_and_rejects_invalid_moves() {
+    let mut filesystem = fresh_rw();
+    let root = filesystem.lookup("/").unwrap();
+
+    // Regular file over regular file frees the replaced inode.
+    let a = create_file(&mut filesystem, "/a.txt", b"AAA");
+    let b = create_file(&mut filesystem, "/b.txt", b"BBB");
+    let free_inodes = filesystem.superblock().free_inodes_count();
+    filesystem.rename("/a.txt", "/b.txt", false).unwrap();
+    assert_eq!(filesystem.lookup("/a.txt"), Err(Ext2Error::NotFound));
+    assert_eq!(filesystem.lookup("/b.txt").unwrap(), a);
+    assert!(!filesystem.is_inode_allocated(b).unwrap());
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes + 1);
+    assert_eq!(read_all(&mut filesystem, a), b"AAA");
+
+    // Replacing an open target defers its free until the final close.
+    let x = create_file(&mut filesystem, "/x.txt", b"X");
+    let y = create_file(&mut filesystem, "/y.txt", b"Y");
+    filesystem.rename("/x.txt", "/y.txt", true).unwrap();
+    assert_eq!(filesystem.lookup("/y.txt").unwrap(), x);
+    assert!(filesystem.is_inode_allocated(y).unwrap());
+    assert_eq!(filesystem.links_count(y).unwrap(), 0);
+    filesystem.release_unlinked_inode(y).unwrap();
+    assert!(!filesystem.is_inode_allocated(y).unwrap());
+
+    // Directory over an empty directory drops the replaced entry's link.
+    let d1 = filesystem.mkdir("/d1", 0o755).unwrap();
+    let _inside = create_file(&mut filesystem, "/d1/inside", b"in");
+    let d2 = filesystem.mkdir("/d2", 0o755).unwrap();
+    let root_links = filesystem.links_count(root).unwrap();
+    filesystem.rename("/d1", "/d2", false).unwrap();
+    assert_eq!(filesystem.lookup("/d1"), Err(Ext2Error::NotFound));
+    assert_eq!(filesystem.lookup("/d2").unwrap(), d1);
+    assert_eq!(filesystem.lookup("/d2/..").unwrap(), root);
+    assert_eq!(filesystem.links_count(root).unwrap(), root_links - 1);
+    assert!(!filesystem.is_inode_allocated(d2).unwrap());
+    let inside = filesystem.lookup("/d2/inside").unwrap();
+    assert_eq!(read_all(&mut filesystem, inside), b"in");
+
+    // Type mismatches and non-empty destinations are rejected.
+    let target_file = create_file(&mut filesystem, "/target.txt", b"target");
+    let target_dir = filesystem.mkdir("/targetdir", 0o755).unwrap();
+    assert_eq!(
+        filesystem.rename("/target.txt", "/targetdir", false),
+        Err(Ext2Error::NotFile)
+    );
+    assert_eq!(
+        filesystem.rename("/targetdir", "/target.txt", false),
+        Err(Ext2Error::NotDirectory)
+    );
+    let _ne_dir = filesystem.mkdir("/ne", 0o755).unwrap();
+    let _ne_file = create_file(&mut filesystem, "/ne/file", b"ne");
+    let _occupied = filesystem.mkdir("/occupied", 0o755).unwrap();
+    let _occupied_file = create_file(&mut filesystem, "/occupied/keep", b"keep");
+    assert_eq!(
+        filesystem.rename("/ne", "/occupied", false),
+        Err(Ext2Error::NotEmpty)
+    );
+
+    // Moving a directory into itself or a descendant is a loop.
+    let loop_dir = filesystem.mkdir("/loopdir", 0o755).unwrap();
+    let inner = filesystem.mkdir("/loopdir/inner", 0o755).unwrap();
+    assert_eq!(
+        filesystem.rename("/loopdir", "/loopdir/inner/loopdir", false),
+        Err(Ext2Error::InvalidArgument)
+    );
+    assert_eq!(
+        filesystem.rename("/loopdir", "/loopdir/inner", false),
+        Err(Ext2Error::InvalidArgument)
+    );
+    assert_eq!(filesystem.lookup("/loopdir").unwrap(), loop_dir);
+    assert_eq!(filesystem.lookup("/loopdir/inner").unwrap(), inner);
+    assert_eq!(filesystem.lookup("/target.txt").unwrap(), target_file);
+    assert_eq!(filesystem.lookup("/targetdir").unwrap(), target_dir);
+
+    filesystem.sync().unwrap();
     let disk = filesystem.into_device();
     e2fsck(disk.data());
 }
