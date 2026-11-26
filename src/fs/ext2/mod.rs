@@ -720,6 +720,9 @@ impl<D: BlockDevice> Ext2<D> {
             let _ = self.free_inode(child, false);
             return Err(error);
         }
+        // One flush per created file: the inode, entry and bitmaps are durable
+        // before the syscall returns.
+        self.device.flush()?;
         Ok(child)
     }
 
@@ -855,6 +858,7 @@ impl<D: BlockDevice> Ext2<D> {
             let _ = self.free_inode(child, true);
             return Err(error);
         }
+        self.device.flush()?;
         Ok(child)
     }
 
@@ -893,7 +897,7 @@ impl<D: BlockDevice> Ext2<D> {
         let links = parent_inode.links_count().saturating_sub(1);
         parent_inode.set_links_count(links);
         self.write_inode(&mut parent_inode)?;
-        Ok(())
+        self.device.flush()
     }
 
     /// Remove a non-directory entry. When the last link disappears the inode is
@@ -930,6 +934,7 @@ impl<D: BlockDevice> Ext2<D> {
             // close calls `release_unlinked_inode`.
             self.write_inode(&mut inode)?;
         }
+        self.device.flush()?;
         Ok(target)
     }
 
@@ -952,7 +957,10 @@ impl<D: BlockDevice> Ext2<D> {
         self.free_inode_contents(&mut inode)?;
         inode.set_dtime(self.now());
         self.write_inode(&mut inode)?;
-        self.free_inode(node, false)
+        self.free_inode(node, false)?;
+        // The deferred deletion only becomes durable when the last close
+        // finishes it.
+        self.device.flush()
     }
 
     /// Move `old_path` to `new_path`, replacing an existing destination when
@@ -1056,7 +1064,7 @@ impl<D: BlockDevice> Ext2<D> {
                 )?;
             }
             self.write_inode(&mut new_parent_inode)?;
-            return Ok(());
+            return self.device.flush();
         }
 
         // Different parents. Remove the destination entry but keep its inode
@@ -1109,7 +1117,7 @@ impl<D: BlockDevice> Ext2<D> {
             self.write_inode(&mut old_parent_inode)?;
             self.write_inode(&mut new_parent_inode)?;
         }
-        Ok(())
+        self.device.flush()
     }
 
     fn is_dir_empty(&mut self, node: NodeId) -> Result<bool, Ext2Error> {
@@ -1390,10 +1398,19 @@ impl<D: BlockDevice> Ext2<D> {
             inode.set_ctime(now);
             self.write_inode(&mut inode)?;
         }
-        match failure {
+        let written = match failure {
             Some(error) if done == 0 => Err(error),
             Some(_) => Ok(done),
             None => Ok(done),
+        };
+        // A partial write still commits its prefix, so flush either way but
+        // never mask the error that stopped the transfer.
+        match written {
+            Ok(count) => {
+                self.device.flush()?;
+                Ok(count)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1445,7 +1462,8 @@ impl<D: BlockDevice> Ext2<D> {
         let now = self.now();
         inode.set_mtime(now);
         inode.set_ctime(now);
-        self.write_inode(&mut inode)
+        self.write_inode(&mut inode)?;
+        self.device.flush()
     }
 
     /// Free every data and indirect block at or after `start_logical`.

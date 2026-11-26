@@ -92,6 +92,29 @@ fn build_minimal_image(block_size: &str, inode_size: &str, blocks: &str) -> Vec<
     data
 }
 
+/// An empty ext2 volume without fixture files, used by the fill/recycle test.
+fn build_blank_image(blocks: &str) -> Vec<u8> {
+    let base = std::env::temp_dir().join(format!(
+        "rinux-ext2-blank-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&base).unwrap();
+    let image = base.join("image");
+    let status = Command::new("mke2fs")
+        .args(["-t", "ext2", "-b", "1024", "-I", "128", "-F", "-q"])
+        .arg(&image)
+        .arg(blocks)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("mke2fs must be installed");
+    assert!(status.success(), "mke2fs failed");
+    let data = fs::read(&image).unwrap();
+    fs::remove_dir_all(&base).ok();
+    data
+}
+
 struct MemoryDevice {
     data: Vec<u8>,
     reads: usize,
@@ -1496,6 +1519,109 @@ fn rename_replaces_targets_and_rejects_invalid_moves() {
     assert_eq!(filesystem.lookup("/loopdir/inner").unwrap(), inner);
     assert_eq!(filesystem.lookup("/target.txt").unwrap(), target_file);
     assert_eq!(filesystem.lookup("/targetdir").unwrap(), target_dir);
+
+    filesystem.sync().unwrap();
+    let disk = filesystem.into_device();
+    e2fsck(disk.data());
+}
+
+#[test]
+fn fills_and_recycles_a_small_volume() {
+    let mut filesystem = Ext2::mount_rw_with_clock(
+        RamDisk::new(build_blank_image("1024")),
+        || 1_700_000_000,
+    )
+    .unwrap();
+    let free_blocks = filesystem.superblock().free_blocks_count();
+    let free_inodes = filesystem.superblock().free_inodes_count();
+    let used_dirs = filesystem.group_descriptor(0).unwrap().used_dirs_count;
+
+    // Batched flush policy: one drive flush per completed operation, however
+    // many blocks the operation transfers.
+    let flush_base = filesystem.device().flushes();
+    filesystem.mkdir("/flush-check", 0o755).unwrap();
+    assert_eq!(filesystem.device().flushes(), flush_base + 1);
+    filesystem.rmdir("/flush-check").unwrap();
+    assert_eq!(filesystem.device().flushes(), flush_base + 2);
+
+    let node = filesystem
+        .open_flags("/flush.bin", O_CREAT | O_RDWR, 0o644)
+        .unwrap();
+    let writes_base = filesystem.device().writes();
+    let flush_base = filesystem.device().flushes();
+    let payload: Vec<u8> = (0..4 * 1024).map(pattern).collect();
+    assert_eq!(
+        filesystem.write_file(node, 0, &payload).unwrap(),
+        payload.len()
+    );
+    assert_eq!(filesystem.device().flushes(), flush_base + 1);
+    assert!(filesystem.device().writes() - writes_base > 1);
+    assert_eq!(read_all(&mut filesystem, node), payload);
+    filesystem.unlink("/flush.bin", false).unwrap();
+
+    filesystem.mkdir("/stress", 0o755).unwrap();
+    filesystem.mkdir("/stress/d0", 0o755).unwrap();
+    filesystem.mkdir("/stress/d0/d1", 0o755).unwrap();
+    filesystem.mkdir("/stress/d0/d1/d2", 0o755).unwrap();
+
+    // Sixteen blocks per file exhausts the 1 MiB volume before its inodes.
+    let payload: Vec<u8> = (0..16 * 1024).map(pattern).collect();
+    let mut created = Vec::new();
+    let mut hit_full = false;
+    for index in 0..256 {
+        let path = format!("/stress/d0/d1/d2/file-{index:03}.bin");
+        let node = match filesystem.open_flags(&path, O_CREAT | O_RDWR, 0o644) {
+            Ok(node) => node,
+            Err(Ext2Error::NoSpace) => {
+                hit_full = true;
+                break;
+            }
+            Err(error) => panic!("create {} failed: {:?}", path, error),
+        };
+        match filesystem.write_file(node, 0, &payload) {
+            Ok(count) => {
+                created.push(path);
+                if count < payload.len() {
+                    hit_full = true;
+                    break;
+                }
+            }
+            Err(Ext2Error::NoSpace) => {
+                filesystem.unlink(&path, false).unwrap();
+                hit_full = true;
+                break;
+            }
+            Err(error) => panic!("write {} failed: {:?}", path, error),
+        }
+    }
+    assert!(hit_full, "the volume never ran out of space");
+    assert!(created.len() > 10, "only {} files fit", created.len());
+    assert!(filesystem.superblock().free_blocks_count() < free_blocks);
+    let first = filesystem.lookup(&created[0]).unwrap();
+    assert_eq!(read_all(&mut filesystem, first), payload);
+
+    for path in &created {
+        filesystem.unlink(path, false).unwrap();
+    }
+    filesystem.rmdir("/stress/d0/d1/d2").unwrap();
+    filesystem.rmdir("/stress/d0/d1").unwrap();
+    filesystem.rmdir("/stress/d0").unwrap();
+    filesystem.rmdir("/stress").unwrap();
+
+    assert_eq!(filesystem.superblock().free_blocks_count(), free_blocks);
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes);
+    assert_eq!(
+        filesystem.group_descriptor(0).unwrap().used_dirs_count,
+        used_dirs
+    );
+
+    // The freed extents and inodes are reusable.
+    filesystem.mkdir("/recycled", 0o755).unwrap();
+    let reused_payload: Vec<u8> = (0..8 * 1024).map(pattern).collect();
+    let reused = create_file(&mut filesystem, "/recycled/reused.bin", &reused_payload);
+    assert_eq!(read_all(&mut filesystem, reused), reused_payload);
+    assert!(filesystem.superblock().free_blocks_count() < free_blocks);
+    assert_eq!(filesystem.superblock().free_inodes_count(), free_inodes - 2);
 
     filesystem.sync().unwrap();
     let disk = filesystem.into_device();

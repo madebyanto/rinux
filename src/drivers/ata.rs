@@ -165,12 +165,12 @@ mod backend {
             offset = end;
             remaining -= chunk;
         }
-        flush_locked()
+        Ok(())
     }
 
-    /// Flush the drive's write cache. Filesystem code calls this after a batch
-    /// of metadata writes, while `write_sectors` flushes each transfer.
-    #[allow(dead_code)]
+    /// Flush the drive's write cache. Filesystem code calls this once at the
+    /// end of each mutating operation, so a multi-block transfer is only made
+    /// durable by the explicit flush that completes the syscall.
     pub fn flush() -> Result<(), AtaError> {
         let guard = ATA.lock();
         if guard.is_none() {
